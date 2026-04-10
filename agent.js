@@ -533,6 +533,24 @@ app.post('/files/mkdir', (req, res) => {
 app.listen(PORT, '0.0.0.0', () => console.log(`[Agent] API listening on port ${PORT}`));
 
 // ─── Heartbeat ─────────────────────────────────────────────
+function getLocalIp() {
+  const nets = os.networkInterfaces();
+  // Prefer Tailscale (100.x.x.x), then private LAN, then fallback
+  const candidates = [];
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name]) {
+      if (net.family === 'IPv4' && !net.internal) {
+        candidates.push({ name, address: net.address });
+      }
+    }
+  }
+  const tailscale = candidates.find(c => c.address.startsWith('100.'));
+  if (tailscale) return tailscale.address;
+  const lan = candidates.find(c => c.address.startsWith('192.168.') || c.address.startsWith('10.') || c.address.startsWith('172.'));
+  if (lan) return lan.address;
+  return candidates[0]?.address || '127.0.0.1';
+}
+
 async function sendHeartbeat() {
   try {
     const res = await fetch(`${HUB_URL}/api/devices/heartbeat`, {
@@ -542,6 +560,7 @@ async function sendHeartbeat() {
         id: DEVICE_ID, name: DEVICE_NAME,
         platform: process.platform === 'win32' ? 'windows' : process.platform,
         agentPort: PORT,
+        localIp: getLocalIp(),
         version: AGENT_VERSION,
         stats: {
           cpu: cachedStats.cpu.usage, ramUsed: cachedStats.ram.used,
