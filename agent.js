@@ -601,7 +601,9 @@ async function checkForUpdates(force = false) {
       }
       console.log(`[Agent] Update available (${gitStatus.behind} commit(s) behind). Pulling...`);
       updateInProgress = true;
-      await git.pull('origin', 'main');
+      // Hard reset to avoid local change conflicts — agent files should never be manually edited
+      await git.fetch('origin', 'main');
+      await git.reset(['--hard', 'origin/main']);
       console.log('[Agent] Pull complete. Reinstalling dependencies...');
       await new Promise((resolve, reject) => {
         exec('npm install --prefix ' + JSON.stringify(__dirname), { cwd: __dirname, windowsHide: true }, (err) => {
