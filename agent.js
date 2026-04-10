@@ -247,6 +247,14 @@ app.get('/version', (req, res) => {
   res.json({ version: AGENT_VERSION, underTray: UNDER_TRAY });
 });
 
+// Hub calls this when the device is deleted — signal Electron to show disconnect UI
+app.post('/disconnect', (req, res) => {
+  res.json({ success: true });
+  console.log('[Agent] Disconnect signal received from hub');
+  // Signal the tray wrapper via a special exit code
+  setTimeout(() => process.exit(43), 500); // 43 = disconnected by hub
+});
+
 app.post('/update/check', async (req, res) => {
   const result = await checkForUpdates(false);
   res.json(result);
