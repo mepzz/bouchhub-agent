@@ -21,8 +21,13 @@ const PORT = parseInt(AGENT_PORT || '3001');
 const HEARTBEAT_INTERVAL = 5 * 1000;
 const STATS_INTERVAL = 5 * 1000;
 const UPDATE_CHECK_INTERVAL = 5 * 60 * 1000;
-const ROOT = path.join(__dirname, '..');
-const git = simpleGit(ROOT);
+// When running under Electron, use the bundled git and repo dir
+const ROOT = process.env.BOUCHHUB_REPO_DIR || path.join(__dirname, '..');
+const GIT_EXE = process.env.BOUCHHUB_GIT_EXE || 'git';
+const git = simpleGit(ROOT, {
+  binary: GIT_EXE,
+  config: ['core.autocrlf=false'],
+});
 const AGENT_VERSION = (() => {
   try { return require('./package.json').version; } catch { return '0.0.0'; }
 })();
