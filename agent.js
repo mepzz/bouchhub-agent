@@ -27,6 +27,9 @@ const GIT_EXE = process.env.BOUCHHUB_GIT_EXE || 'git';
 const git = simpleGit(ROOT, {
   binary: GIT_EXE,
   config: ['core.autocrlf=false'],
+  unsafe: {
+    allowUnsafeCustomBinary: true,  // allow paths with spaces (e.g. Program Files)
+  },
 });
 const AGENT_VERSION = (() => {
   try { return require('./package.json').version; } catch { return '0.0.0'; }
