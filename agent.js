@@ -77,95 +77,130 @@ setInterval(() => {
 }, 2000);
 
 // ─── PowerShell Runner ─────────────────────────────────────
+// ─── Single PowerShell process for ALL stats ──────────────
+// One process per collection cycle instead of 5-8 separate ones
+let lastNetStats = null;
+
+const ALL_STATS_SCRIPT = `
+  $out = @{}
+
+  # CPU Temp
+  try {
+    $t = (Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace root/wmi -ErrorAction Stop | Select-Object -First 1).CurrentTemperature
+    $out.cpuTemp = [math]::Round(($t - 2732) / 10)
+  } catch { $out.cpuTemp = $null }
+
+  # GPU via nvidia-smi
+  try {
+    $smi = & nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>$null
+    if ($smi) {
+      $p = $smi.Trim().Split(',')
+      $out.gpu = @{ model=$p[0].Trim(); temp=[int]$p[1]; usage=[int]$p[2]; vramUsed=[math]::Round([int]$p[3]/1024,1); vramTotal=[math]::Round([int]$p[4]/1024,1) }
+    }
+  } catch {}
+  if (-not $out.gpu) {
+    try {
+      $vc = Get-WmiObject Win32_VideoController -ErrorAction Stop | Select-Object -First 1
+      $out.gpu = @{ model=$vc.Name; temp=$null; usage=$null; vramUsed=$null; vramTotal=[math]::Round($vc.AdapterRAM/1GB,1) }
+    } catch { $out.gpu = @{ model='N/A'; temp=$null; usage=$null; vramUsed=$null; vramTotal=$null } }
+  }
+
+  # Disks
+  try {
+    $out.disks = @(Get-WmiObject Win32_LogicalDisk -Filter DriveType=3 -ErrorAction Stop | ForEach-Object {
+      $total = [math]::Round($_.Size/1GB,1); $free = [math]::Round($_.FreeSpace/1GB,1)
+      @{ drive=$_.DeviceID; total=$total; used=[math]::Round($total-$free,1); free=$free; pct=[math]::Round(($total-$free)/$total*100) }
+    })
+  } catch { $out.disks = @() }
+
+  # Network
+  try {
+    $out.net = @(Get-NetAdapterStatistics -ErrorAction Stop | Where-Object { $_.ReceivedBytes -gt 0 } | ForEach-Object {
+      @{ name=$_.Name; rx=$_.ReceivedBytes; tx=$_.SentBytes }
+    })
+  } catch { $out.net = @() }
+
+  # Fans
+  try {
+    $out.fans = @(Get-WmiObject Win32_Fan -ErrorAction Stop | Where-Object { $_.DesiredSpeed -gt 0 } | ForEach-Object {
+      @{ name=$_.Name; rpm=$_.DesiredSpeed }
+    })
+  } catch { $out.fans = @() }
+
+  $out | ConvertTo-Json -Depth 5 -Compress
+`.trim();
+
+// Keep one persistent PS process — only spawn if not running
+let psProc = null;
+let psQueue = [];
+let psBuf = '';
+
+function getPSProc() {
+  if (psProc && !psProc.killed) return psProc;
+  const { spawn } = require('child_process');
+  psProc = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', '-'], {
+    windowsHide: true,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  psBuf = '';
+  psProc.stdout.on('data', (data) => {
+    psBuf += data.toString();
+    // Each command ends with a newline — resolve pending
+    const lines = psBuf.split('\n');
+    psBuf = lines.pop(); // keep incomplete last line
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed && psQueue.length > 0) {
+        const { resolve } = psQueue.shift();
+        resolve(trimmed);
+      }
+    }
+  });
+  psProc.on('exit', () => {
+    psProc = null;
+    // Resolve any pending with empty
+    while (psQueue.length > 0) psQueue.shift().resolve('{}');
+  });
+  psProc.stderr.on('data', () => {}); // suppress
+  return psProc;
+}
+
 function runPS(script) {
   return new Promise((resolve) => {
-    exec(`powershell -NoProfile -NonInteractive -Command "${script.replace(/"/g, '\\"')}"`,
-      { timeout: 8000 },
-      (err, stdout) => resolve(err ? '' : stdout.trim())
-    );
+    try {
+      const proc = getPSProc();
+      psQueue.push({ resolve });
+      proc.stdin.write(script.replace(/\r?\n/g, ' ') + '\n');
+    } catch(e) {
+      resolve('');
+    }
   });
 }
 
-// ─── CPU Temp ──────────────────────────────────────────────
-async function getCpuTemp() {
+async function getAllStats() {
   try {
-    const out = await runPS(
-      'Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace root/wmi | Select-Object -First 1 -ExpandProperty CurrentTemperature'
-    );
-    const raw = parseInt(out);
-    if (!isNaN(raw) && raw > 0) return Math.round((raw - 2732) / 10);
-  } catch (_) {}
-  return null;
+    const out = await runPS(ALL_STATS_SCRIPT);
+    return JSON.parse(out);
+  } catch(e) {
+    return {};
+  }
 }
 
-// ─── GPU Stats ─────────────────────────────────────────────
-async function getGpuStats() {
-  try {
-    const out = await runPS(
-      'nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits'
-    );
-    if (out && out.length > 5) {
-      const parts = out.split(',').map(s => s.trim());
-      if (parts.length >= 5) {
-        return {
-          model: parts[0],
-          temp: parseInt(parts[1]) || null,
-          usage: parseInt(parts[2]) || null,
-          vramUsed: Math.round(parseInt(parts[3]) / 1024 * 10) / 10 || null,
-          vramTotal: Math.round(parseInt(parts[4]) / 1024 * 10) / 10 || null,
-        };
-      }
-    }
-  } catch (_) {}
+// ─── Collect All Stats ─────────────────────────────────────
+async function collectStats() {
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = totalMem - freeMem;
+  const cpus = os.cpus();
 
-  try {
-    const name = await runPS('Get-WmiObject Win32_VideoController | Select-Object -First 1 -ExpandProperty Name');
-    const vramRaw = await runPS('Get-WmiObject Win32_VideoController | Select-Object -First 1 -ExpandProperty AdapterRAM');
-    const vramTotal = vramRaw ? Math.round(parseInt(vramRaw) / 1024 / 1024 / 1024 * 10) / 10 : null;
-    return { model: name || 'Unknown GPU', temp: null, usage: null, vramUsed: null, vramTotal };
-  } catch (_) {}
+  // Single PS process for all system stats — no more process pile-up
+  const psStats = await getAllStats();
 
-  return { model: 'N/A', temp: null, usage: null, vramUsed: null, vramTotal: null };
-}
-
-// ─── Disk Stats ────────────────────────────────────────────
-async function getDiskStats() {
-  try {
-    const out = await runPS(
-      'Get-WmiObject Win32_LogicalDisk -Filter DriveType=3 | ForEach-Object { $_.DeviceID + "," + $_.Size + "," + $_.FreeSpace }'
-    );
-    return out.split('\n').filter(l => l.trim()).map(line => {
-      const parts = line.trim().split(',');
-      if (parts.length < 3) return null;
-      const total = parseInt(parts[1]) / 1024 / 1024 / 1024;
-      const free = parseInt(parts[2]) / 1024 / 1024 / 1024;
-      const used = total - free;
-      return {
-        drive: parts[0],
-        total: Math.round(total * 10) / 10,
-        used: Math.round(used * 10) / 10,
-        free: Math.round(free * 10) / 10,
-        pct: Math.round((used / total) * 100)
-      };
-    }).filter(Boolean);
-  } catch (_) { return []; }
-}
-
-// ─── Network Stats ─────────────────────────────────────────
-let lastNetStats = null;
-async function getNetworkStats() {
-  try {
-    const out = await runPS(
-      'Get-NetAdapterStatistics | Where-Object { $_.ReceivedBytes -gt 0 } | ForEach-Object { $_.Name + "," + $_.ReceivedBytes + "," + $_.SentBytes }'
-    );
-    const now = Date.now();
-    const adapters = out.split('\n').filter(l => l.trim() && l.includes(',')).map(line => {
-      const parts = line.trim().split(',');
-      if (parts.length < 3) return null;
-      return { name: parts[0], rx: parseInt(parts[1]) || 0, tx: parseInt(parts[2]) || 0 };
-    }).filter(Boolean);
-
-    const result = adapters.map(a => {
+  // Compute network speeds from delta
+  const now = Date.now();
+  let network = [];
+  if (psStats.net && Array.isArray(psStats.net)) {
+    network = psStats.net.map(a => {
       let rxSpeed = 0, txSpeed = 0;
       if (lastNetStats) {
         const prev = lastNetStats.adapters.find(p => p.name === a.name);
@@ -177,47 +212,20 @@ async function getNetworkStats() {
       }
       return { name: a.name, rxMBs: rxSpeed, txMBs: txSpeed };
     });
-
-    lastNetStats = { time: now, adapters };
-    return result;
-  } catch (_) { return []; }
-}
-
-// ─── Fan Speeds ────────────────────────────────────────────
-async function getFanSpeeds() {
-  try {
-    const out = await runPS(
-      'Get-WmiObject Win32_Fan | ForEach-Object { $_.Name + "," + $_.DesiredSpeed }'
-    );
-    return out.split('\n').filter(l => l.includes(',')).map(line => {
-      const parts = line.trim().split(',');
-      return { name: parts[0], rpm: parseInt(parts[1]) || 0 };
-    }).filter(f => f.rpm > 0);
-  } catch (_) { return []; }
-}
-
-// ─── Collect All Stats ─────────────────────────────────────
-async function collectStats() {
-  const totalMem = os.totalmem();
-  const freeMem = os.freemem();
-  const usedMem = totalMem - freeMem;
-  const cpus = os.cpus();
-
-  const [cpuTemp, gpu, disks, network, fans] = await Promise.all([
-    getCpuTemp(), getGpuStats(), getDiskStats(), getNetworkStats(), getFanSpeeds()
-  ]);
+    lastNetStats = { time: now, adapters: psStats.net };
+  }
 
   cachedStats = {
-    cpu: { usage: cpuUsagePct, temp: cpuTemp, model: cpus[0]?.model?.trim() || 'Unknown', cores: cpus.length },
-    gpu,
+    cpu: { usage: cpuUsagePct, temp: psStats.cpuTemp ?? null, model: cpus[0]?.model?.trim() || 'Unknown', cores: cpus.length },
+    gpu: psStats.gpu ?? { model: 'N/A', temp: null, usage: null, vramUsed: null, vramTotal: null },
     ram: {
       used: Math.round(usedMem / 1024 / 1024 / 1024 * 10) / 10,
       total: Math.round(totalMem / 1024 / 1024 / 1024 * 10) / 10,
       pct: Math.round((usedMem / totalMem) * 100)
     },
-    disks,
+    disks: psStats.disks ?? [],
     network,
-    fans,
+    fans: psStats.fans ?? [],
     uptime: Math.floor(os.uptime()),
     timestamp: Date.now()
   };
@@ -657,6 +665,54 @@ app.post('/files/mkdir', (req, res) => {
   }
 });
 
+
+// ─── Screen Capture Routes ──────────────────────────────────
+let screenModule;
+try { screenModule = require('./screen'); } catch (e) {
+  console.warn('[Agent] screen module not available:', e.message);
+}
+
+// GET /screen/monitors — list displays
+app.get('/screen/monitors', async (req, res) => {
+  if (!screenModule) return res.status(503).json({ error: 'screen module not available' });
+  try { res.json({ monitors: await screenModule.getMonitors() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /screen/start — begin streaming frames to hub
+app.post('/screen/start', async (req, res) => {
+  if (!screenModule) return res.status(503).json({ error: 'screen module not available' });
+  const { monitorIndex, callbackUrl, agentSecret, fps } = req.body;
+  if (!callbackUrl) return res.status(400).json({ error: 'callbackUrl required' });
+  try {
+    const result = await screenModule.startStream({ monitorIndex: monitorIndex || 0, callbackUrl, agentSecret, fps });
+    // Notify the Electron tray to show sharing notification
+    if (process.env.BOUCHHUB_TRAY) {
+      try { process.send && process.send({ type: 'screen_sharing_started' }); } catch (_) {}
+    }
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /screen/stop — stop streaming
+app.post('/screen/stop', async (req, res) => {
+  if (!screenModule) return res.status(503).json({ error: 'screen module not available' });
+  try {
+    await screenModule.stopStream();
+    if (process.env.BOUCHHUB_TRAY) {
+      try { process.send && process.send({ type: 'screen_sharing_stopped' }); } catch (_) {}
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /screen/input — receive mouse/keyboard events from hub
+app.post('/screen/input', async (req, res) => {
+  if (!screenModule) return res.status(503).json({ error: 'screen module not available' });
+  try { res.json(await screenModule.handleInput(req.body)); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, '0.0.0.0', () => console.log(`[Agent] API listening on port ${PORT}`));
 
 // ─── Heartbeat ─────────────────────────────────────────────
@@ -814,3 +870,4 @@ start().catch(err => {
   console.error('[Agent] Fatal error:', err.message);
   process.exit(1);
 });
+
