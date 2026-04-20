@@ -164,24 +164,45 @@ async function stopStream() {
 
 // ── Input handling ───────────────────────────────────────────
 async function handleInput(data) {
-  if (!nutTree) return { error: 'Input control not available' };
+  if (!nutTree) return { error: 'Input control not available (@nut-tree-fork/nut-js not installed)' };
   const { mouse, keyboard, Button, Key } = nutTree;
   try {
     if (data.type === 'mousemove') {
       await mouse.setPosition({ x: Math.round(data.x), y: Math.round(data.y) });
+
     } else if (data.type === 'mousedown') {
+      // Move first then press so click lands in right spot
+      if (data.x !== undefined) await mouse.setPosition({ x: Math.round(data.x), y: Math.round(data.y) });
       await mouse.pressButton(data.button === 2 ? Button.RIGHT : Button.LEFT);
+
     } else if (data.type === 'mouseup') {
       await mouse.releaseButton(data.button === 2 ? Button.RIGHT : Button.LEFT);
+
     } else if (data.type === 'scroll') {
-      if (data.deltaY > 0) await mouse.scrollDown(3);
-      else await mouse.scrollUp(3);
+      const amount = Math.ceil(Math.abs(data.deltaY) / 100);
+      if (data.deltaY > 0) await mouse.scrollDown(amount);
+      else await mouse.scrollUp(amount);
+
     } else if (data.type === 'keydown') {
       const k = mapKey(Key, data.key);
-      if (k !== null) await keyboard.pressKey(k);
+      if (k === null) return { success: true };
+      // Build modifier combo
+      const keys = [];
+      if (data.ctrl) keys.push(Key.LeftControl);
+      if (data.shift) keys.push(Key.LeftShift);
+      if (data.alt) keys.push(Key.LeftAlt);
+      keys.push(k);
+      if (keys.length > 1) {
+        await keyboard.pressKey(...keys);
+        await keyboard.releaseKey(...keys);
+      } else {
+        await keyboard.pressKey(k);
+      }
+
     } else if (data.type === 'keyup') {
       const k = mapKey(Key, data.key);
       if (k !== null) await keyboard.releaseKey(k);
+
     } else if (data.type === 'type') {
       await keyboard.type(data.text);
     }
@@ -210,3 +231,4 @@ function mapKey(Key, keyName) {
 }
 
 module.exports = { getMonitors, startStream, stopStream, handleInput };
+
