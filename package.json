@@ -1,6 +1,6 @@
 {
   "name": "bouchhub-agent",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "BouchHub Agent \u2014 remote device management",
   "main": "electron/main.js",
   "scripts": {
