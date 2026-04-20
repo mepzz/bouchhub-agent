@@ -165,14 +165,27 @@ function getPSProc() {
   return psProc;
 }
 
-function runPS(script) {
+function runPS(script, timeoutMs = 8000) {
   return new Promise((resolve) => {
+    let settled = false;
+    const done = (val) => { if (!settled) { settled = true; resolve(val); } };
+
+    // Timeout guard — if PS never responds, unblock
+    const timer = setTimeout(() => {
+      console.warn('[Agent] PowerShell stats timed out — skipping');
+      // Remove from queue if still pending
+      const idx = psQueue.findIndex(q => q.resolve === done);
+      if (idx !== -1) psQueue.splice(idx, 1);
+      done('{}');
+    }, timeoutMs);
+
     try {
       const proc = getPSProc();
-      psQueue.push({ resolve });
+      psQueue.push({ resolve: (val) => { clearTimeout(timer); done(val); } });
       proc.stdin.write(script.replace(/\r?\n/g, ' ') + '\n');
     } catch(e) {
-      resolve('');
+      clearTimeout(timer);
+      done('{}');
     }
   });
 }
@@ -852,7 +865,14 @@ async function start() {
   console.log('╚════════════════════════════════════╝\n');
 
   console.log('[Agent] Collecting initial stats...');
-  await collectStats();
+  try {
+    await Promise.race([
+      collectStats(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('stats timeout')), 10000))
+    ]);
+  } catch (e) {
+    console.warn('[Agent] Initial stats collection skipped:', e.message);
+  }
 
   await sendHeartbeat();
   heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
@@ -870,4 +890,5 @@ start().catch(err => {
   console.error('[Agent] Fatal error:', err.message);
   process.exit(1);
 });
+
 
