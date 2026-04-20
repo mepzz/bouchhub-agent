@@ -1,8 +1,7 @@
-// screen.js — BouchHub Agent screen capture & input module
-// Uses PowerShell + .NET for screenshots (no external bat dependencies)
-// Uses @nut-tree-fork/nut-js for mouse/keyboard input
+// screen.js — BouchHub Agent screen capture using FFmpeg gdigrab
+// Captures frames via FFmpeg, streams JPEG to hub over HTTP POST
 
-const { exec, execSync } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -15,149 +14,158 @@ try { nutTree = require('@nut-tree-fork/nut-js'); } catch (e) {
 const TMP_DIR = path.join(os.tmpdir(), 'bouchhub-screen');
 try { fs.mkdirSync(TMP_DIR, { recursive: true }); } catch (_) {}
 
-let streamInterval = null;
-let currentMonitor = 0;
+let ffmpegProc = null;
+let isStreaming = false;
 let callbackUrl = null;
 let agentSecret = null;
-let isStreaming = false;
-let frameCount = 0;
+let currentMonitor = 0;
+let monitors = null;
 
-// ── Monitor listing via PowerShell ──────────────────────────
+// ── Monitor listing via PowerShell .ps1 file ─────────────────
 async function getMonitors() {
   return new Promise((resolve) => {
-    const script = `
+    const ps1 = path.join(TMP_DIR, 'list_monitors.ps1');
+    fs.writeFileSync(ps1, `
 Add-Type -AssemblyName System.Windows.Forms
 $screens = [System.Windows.Forms.Screen]::AllScreens
 $out = @()
 foreach ($s in $screens) {
-  $out += @{
-    name = $s.DeviceName
-    width = $s.Bounds.Width
-    height = $s.Bounds.Height
-    x = $s.Bounds.X
-    y = $s.Bounds.Y
-    primary = $s.Primary
-  }
+  $out += @{ name=$s.DeviceName; width=$s.Bounds.Width; height=$s.Bounds.Height; x=$s.Bounds.X; y=$s.Bounds.Y; primary=$s.Primary }
 }
-$out | ConvertTo-Json -Compress`;
-
-    exec(`powershell -NoProfile -NonInteractive -Command "${script.replace(/"/g, '\\"')}"`,
+$out | ConvertTo-Json -Compress
+`);
+    const { exec } = require('child_process');
+    exec(`powershell -NoProfile -ExecutionPolicy Bypass -File "${ps1}"`,
       { windowsHide: true, timeout: 8000 },
       (err, stdout) => {
-        if (err || !stdout.trim()) {
-          return resolve([{ id: 0, name: 'Display 1', primary: true }]);
-        }
+        if (err || !stdout.trim()) return resolve([{ id: 0, name: 'Display 1', primary: true }]);
         try {
           let parsed = JSON.parse(stdout.trim());
           if (!Array.isArray(parsed)) parsed = [parsed];
-          resolve(parsed.map((s, i) => ({
-            id: i,
-            name: s.name || `Display ${i + 1}`,
-            width: s.width,
-            height: s.height,
-            x: s.x,
-            y: s.y,
-            primary: s.primary || i === 0,
-          })));
-        } catch {
-          resolve([{ id: 0, name: 'Display 1', primary: true }]);
-        }
+          monitors = parsed.map((s, i) => ({
+            id: i, name: s.name || `Display ${i + 1}`,
+            width: s.width, height: s.height,
+            x: s.x, y: s.y, primary: s.primary || i === 0,
+          }));
+          resolve(monitors);
+        } catch { resolve([{ id: 0, name: 'Display 1', primary: true }]); }
       }
     );
   });
 }
 
-// ── Screenshot via PowerShell + .NET ────────────────────────
-async function captureFrame(monitorIndex) {
-  const tmpFile = path.join(TMP_DIR, `frame_${frameCount++ % 5}.jpg`);
-
-  return new Promise((resolve, reject) => {
-    const script = `
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-$screens = [System.Windows.Forms.Screen]::AllScreens
-$idx = ${monitorIndex}
-if ($idx -ge $screens.Length) { $idx = 0 }
-$screen = $screens[$idx]
-$bmp = New-Object System.Drawing.Bitmap($screen.Bounds.Width, $screen.Bounds.Height)
-$g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($screen.Bounds.Location, [System.Drawing.Point]::Empty, $screen.Bounds.Size)
-$g.Dispose()
-$enc = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
-$params = New-Object System.Drawing.Imaging.EncoderParameters(1)
-$params.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, 50L)
-$bmp.Save('${tmpFile.replace(/\\/g, '\\\\')}', $enc, $params)
-$bmp.Dispose()`;
-
-    exec(`powershell -NoProfile -NonInteractive -Command "${script.replace(/"/g, '\\"').replace(/\n/g, ' ')}"`,
-      { windowsHide: true, timeout: 5000 },
-      (err) => {
-        if (err) return reject(new Error('Screenshot failed: ' + err.message));
-        try {
-          const buf = fs.readFileSync(tmpFile);
-          resolve(buf);
-        } catch (e) {
-          reject(new Error('Could not read screenshot file: ' + e.message));
-        }
-      }
-    );
-  });
-}
-
-// ── Stream control ───────────────────────────────────────────
+// ── FFmpeg screen capture stream ─────────────────────────────
 async function startStream(options) {
   if (isStreaming) await stopStream();
+
   callbackUrl = options.callbackUrl;
   agentSecret = options.agentSecret;
   currentMonitor = options.monitorIndex || 0;
   isStreaming = true;
 
-  const fps = options.fps || 5; // 5fps — good balance for PowerShell-based capture
-  const interval = Math.floor(1000 / fps);
+  // Get monitor info if we don't have it
+  if (!monitors) await getMonitors();
+  const mon = monitors[currentMonitor] || monitors[0];
 
-  console.log(`[Screen] Starting stream → monitor ${currentMonitor} @ ${fps}fps`);
+  const fps = 10;
+  const width = mon ? mon.width : 1920;
+  const height = mon ? mon.height : 1080;
+  const offsetX = mon ? mon.x : 0;
+  const offsetY = mon ? mon.y : 0;
 
+  // Scale down for bandwidth — cap at 1280 wide
+  const scaleW = Math.min(width, 1280);
+  const scaleH = Math.round((scaleW / width) * height);
+
+  console.log(`[Screen] Starting FFmpeg stream → monitor ${currentMonitor} (${width}x${height} @ ${offsetX},${offsetY}) scaled to ${scaleW}x${scaleH} @ ${fps}fps`);
+
+  // FFmpeg reads desktop, outputs MJPEG frames to stdout
+  // gdigrab offset_x/offset_y lets us target a specific monitor
+  ffmpegProc = spawn('ffmpeg', [
+    '-f', 'gdigrab',
+    '-framerate', String(fps),
+    '-offset_x', String(offsetX),
+    '-offset_y', String(offsetY),
+    '-video_size', `${width}x${height}`,
+    '-i', 'desktop',
+    '-vf', `scale=${scaleW}:${scaleH}`,
+    '-f', 'image2pipe',
+    '-vcodec', 'mjpeg',
+    '-q:v', '5',   // JPEG quality 1=best, 31=worst — 5 is good balance
+    'pipe:1',
+  ], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+
+  ffmpegProc.on('error', (e) => {
+    console.error('[Screen] FFmpeg error:', e.message);
+    isStreaming = false;
+  });
+
+  ffmpegProc.on('close', (code) => {
+    console.log('[Screen] FFmpeg exited code:', code);
+    isStreaming = false;
+    ffmpegProc = null;
+  });
+
+  // Parse MJPEG frames from stdout and POST each one to hub
   const nodeFetch = require('node-fetch');
-  let capturing = false;
+  let buf = Buffer.alloc(0);
+  let posting = false;
 
-  streamInterval = setInterval(async () => {
-    if (!isStreaming || !callbackUrl || capturing) return;
-    capturing = true;
-    try {
-      const frame = await captureFrame(currentMonitor);
-      await nodeFetch(callbackUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'image/jpeg', 'x-agent-secret': agentSecret },
-        body: frame,
-        timeout: 3000,
-      });
-    } catch (e) {
-      if (e.message && (e.message.includes('410') || e.message.includes('ECONNREFUSED'))) {
-        console.log('[Screen] Hub session gone — stopping stream');
-        stopStream();
-      } else {
-        console.warn('[Screen] Frame error:', e.message);
-      }
-    } finally {
-      capturing = false;
+  ffmpegProc.stdout.on('data', (chunk) => {
+    if (!isStreaming) return;
+    buf = Buffer.concat([buf, chunk]);
+
+    // MJPEG frames start with FF D8 and end with FF D9
+    let start = -1;
+    for (let i = 0; i < buf.length - 1; i++) {
+      if (buf[i] === 0xFF && buf[i + 1] === 0xD8) { start = i; break; }
     }
-  }, interval);
+    if (start === -1) return;
+
+    let end = -1;
+    for (let i = start + 2; i < buf.length - 1; i++) {
+      if (buf[i] === 0xFF && buf[i + 1] === 0xD9) { end = i + 2; break; }
+    }
+    if (end === -1) return;
+
+    const frame = buf.slice(start, end);
+    buf = buf.slice(end);
+
+    // Don't queue up frames if we're still posting the last one
+    if (posting) return;
+    posting = true;
+
+    nodeFetch(callbackUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/jpeg', 'x-agent-secret': agentSecret },
+      body: frame,
+      timeout: 3000,
+    }).then(() => { posting = false; })
+      .catch((e) => {
+        posting = false;
+        if (e.message && (e.message.includes('410') || e.message.includes('ECONNREFUSED'))) {
+          console.log('[Screen] Hub gone — stopping stream');
+          stopStream();
+        }
+      });
+  });
 
   return { success: true };
 }
 
 async function stopStream() {
   isStreaming = false;
-  if (streamInterval) { clearInterval(streamInterval); streamInterval = null; }
-  callbackUrl = null;
+  if (ffmpegProc) {
+    try { ffmpegProc.kill('SIGKILL'); } catch (_) {}
+    ffmpegProc = null;
+  }
   console.log('[Screen] Stream stopped');
 }
 
 // ── Input handling ───────────────────────────────────────────
 async function handleInput(data) {
-  if (!nutTree) return { error: 'Input control not available (@nut-tree-fork/nut-js not installed)' };
+  if (!nutTree) return { error: 'Input control not available' };
   const { mouse, keyboard, Button, Key } = nutTree;
-
   try {
     if (data.type === 'mousemove') {
       await mouse.setPosition({ x: Math.round(data.x), y: Math.round(data.y) });
