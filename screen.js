@@ -22,32 +22,54 @@ try { fs.mkdirSync(TMP_DIR, { recursive: true }); } catch (_) {}
 // Find FFmpeg — check PATH first, then common install locations
 function findFFmpeg() {
   const { execSync } = require('child_process');
-  // Try PATH first
+
+  // 1. Check local.config.json (machine-specific, gitignored — set ffmpegPath here)
+  try {
+    const localConfig = JSON.parse(fs.readFileSync(path.join(__dirname, 'local.config.json'), 'utf8'));
+    if (localConfig.ffmpegPath && fs.existsSync(localConfig.ffmpegPath)) {
+      console.log('[Screen] FFmpeg from local.config.json:', localConfig.ffmpegPath);
+      return localConfig.ffmpegPath;
+    }
+  } catch (_) {}
+
+  // 2. Try system PATH
   try {
     execSync('ffmpeg -version', { windowsHide: true, timeout: 3000, stdio: 'ignore' });
+    console.log('[Screen] FFmpeg found in PATH');
     return 'ffmpeg';
   } catch (_) {}
-  // Common Windows install locations
+
+  // 3. Scan WinGet packages folder
+  try {
+    const winget = path.join(os.homedir(), 'AppData', 'Local', 'Microsoft', 'WinGet', 'Packages');
+    const dirs = fs.readdirSync(winget).filter(d => d.toLowerCase().startsWith('gyan.ffmpeg'));
+    for (const dir of dirs) {
+      const dirPath = path.join(winget, dir);
+      const sub = fs.readdirSync(dirPath).find(f => f.toLowerCase().startsWith('ffmpeg'));
+      if (sub) {
+        const bin = path.join(dirPath, sub, 'bin', 'ffmpeg.exe');
+        if (fs.existsSync(bin)) {
+          console.log('[Screen] FFmpeg found in WinGet:', bin);
+          return bin;
+        }
+      }
+    }
+  } catch (_) {}
+
+  // 4. Other common locations
   const candidates = [
-    // WinGet installs
-    ...(process.env.LOCALAPPDATA ? (() => {
-      try {
-        const winget = path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Packages');
-        const dirs = fs.readdirSync(winget).filter(d => d.startsWith('Gyan.FFmpeg'));
-        return dirs.map(d => path.join(winget, d, fs.readdirSync(path.join(winget, d)).find(f => f.startsWith('ffmpeg')) || '', 'bin', 'ffmpeg.exe')).filter(p => fs.existsSync(p));
-      } catch { return []; }
-    })() : []),
     'C:\ffmpeg\bin\ffmpeg.exe',
     'C:\Program Files\ffmpeg\bin\ffmpeg.exe',
     path.join(os.homedir(), 'AppData', 'Local', 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe'),
   ];
   for (const c of candidates) {
-    if (c && fs.existsSync(c)) {
-      console.log('[Screen] Found FFmpeg at:', c);
+    if (fs.existsSync(c)) {
+      console.log('[Screen] FFmpeg found at:', c);
       return c;
     }
   }
-  console.warn('[Screen] FFmpeg not found — screen capture will fail');
+
+  console.warn('[Screen] FFmpeg not found. Create local.config.json with {"ffmpegPath":"C:\\path\\to\\ffmpeg.exe"}');
   return 'ffmpeg';
 }
 
@@ -268,6 +290,7 @@ function mapKey(Key, keyName) {
 }
 
 module.exports = { getMonitors, startStream, stopStream, handleInput };
+
 
 
 
