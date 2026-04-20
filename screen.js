@@ -19,6 +19,40 @@ try {
 const TMP_DIR = path.join(os.tmpdir(), 'bouchhub-screen');
 try { fs.mkdirSync(TMP_DIR, { recursive: true }); } catch (_) {}
 
+// Find FFmpeg — check PATH first, then common install locations
+function findFFmpeg() {
+  const { execSync } = require('child_process');
+  // Try PATH first
+  try {
+    execSync('ffmpeg -version', { windowsHide: true, timeout: 3000, stdio: 'ignore' });
+    return 'ffmpeg';
+  } catch (_) {}
+  // Common Windows install locations
+  const candidates = [
+    // WinGet installs
+    ...(process.env.LOCALAPPDATA ? (() => {
+      try {
+        const winget = path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Packages');
+        const dirs = fs.readdirSync(winget).filter(d => d.startsWith('Gyan.FFmpeg'));
+        return dirs.map(d => path.join(winget, d, fs.readdirSync(path.join(winget, d)).find(f => f.startsWith('ffmpeg')) || '', 'bin', 'ffmpeg.exe')).filter(p => fs.existsSync(p));
+      } catch { return []; }
+    })() : []),
+    'C:\ffmpeg\bin\ffmpeg.exe',
+    'C:\Program Files\ffmpeg\bin\ffmpeg.exe',
+    path.join(os.homedir(), 'AppData', 'Local', 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe'),
+  ];
+  for (const c of candidates) {
+    if (c && fs.existsSync(c)) {
+      console.log('[Screen] Found FFmpeg at:', c);
+      return c;
+    }
+  }
+  console.warn('[Screen] FFmpeg not found — screen capture will fail');
+  return 'ffmpeg';
+}
+
+const FFMPEG = findFFmpeg();
+
 let ffmpegProc = null;
 let isStreaming = false;
 let callbackUrl = null;
@@ -86,7 +120,7 @@ async function startStream(options) {
 
   // FFmpeg reads desktop, outputs MJPEG frames to stdout
   // gdigrab offset_x/offset_y lets us target a specific monitor
-  ffmpegProc = spawn('ffmpeg', [
+  ffmpegProc = spawn(FFMPEG, [
     '-f', 'gdigrab',
     '-framerate', String(fps),
     '-offset_x', String(offsetX),
@@ -234,5 +268,6 @@ function mapKey(Key, keyName) {
 }
 
 module.exports = { getMonitors, startStream, stopStream, handleInput };
+
 
 
