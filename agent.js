@@ -76,123 +76,36 @@ setInterval(() => {
   lastCpuTicks = now;
 }, 2000);
 
-// ─── PowerShell Runner ─────────────────────────────────────
-// ─── Single PowerShell process for ALL stats ──────────────
-// One process per collection cycle instead of 5-8 separate ones
+// ─── PowerShell one-shot runner ────────────────────────────
 let lastNetStats = null;
 
-const ALL_STATS_SCRIPT = `
-  $out = @{}
-
-  # CPU Temp
-  try {
-    $t = (Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace root/wmi -ErrorAction Stop | Select-Object -First 1).CurrentTemperature
-    $out.cpuTemp = [math]::Round(($t - 2732) / 10)
-  } catch { $out.cpuTemp = $null }
-
-  # GPU via nvidia-smi
-  try {
-    $smi = & nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>$null
-    if ($smi) {
-      $p = $smi.Trim().Split(',')
-      $out.gpu = @{ model=$p[0].Trim(); temp=[int]$p[1]; usage=[int]$p[2]; vramUsed=[math]::Round([int]$p[3]/1024,1); vramTotal=[math]::Round([int]$p[4]/1024,1) }
-    }
-  } catch {}
-  if (-not $out.gpu) {
-    try {
-      $vc = Get-WmiObject Win32_VideoController -ErrorAction Stop | Select-Object -First 1
-      $out.gpu = @{ model=$vc.Name; temp=$null; usage=$null; vramUsed=$null; vramTotal=[math]::Round($vc.AdapterRAM/1GB,1) }
-    } catch { $out.gpu = @{ model='N/A'; temp=$null; usage=$null; vramUsed=$null; vramTotal=$null } }
-  }
-
-  # Disks
-  try {
-    $out.disks = @(Get-WmiObject Win32_LogicalDisk -Filter DriveType=3 -ErrorAction Stop | ForEach-Object {
-      $total = [math]::Round($_.Size/1GB,1); $free = [math]::Round($_.FreeSpace/1GB,1)
-      @{ drive=$_.DeviceID; total=$total; used=[math]::Round($total-$free,1); free=$free; pct=[math]::Round(($total-$free)/$total*100) }
-    })
-  } catch { $out.disks = @() }
-
-  # Network
-  try {
-    $out.net = @(Get-NetAdapterStatistics -ErrorAction Stop | Where-Object { $_.ReceivedBytes -gt 0 } | ForEach-Object {
-      @{ name=$_.Name; rx=$_.ReceivedBytes; tx=$_.SentBytes }
-    })
-  } catch { $out.net = @() }
-
-  # Fans
-  try {
-    $out.fans = @(Get-WmiObject Win32_Fan -ErrorAction Stop | Where-Object { $_.DesiredSpeed -gt 0 } | ForEach-Object {
-      @{ name=$_.Name; rpm=$_.DesiredSpeed }
-    })
-  } catch { $out.fans = @() }
-
-  $out | ConvertTo-Json -Depth 5 -Compress
-`.trim();
-
-// Keep one persistent PS process — only spawn if not running
-let psProc = null;
-let psQueue = [];
-let psBuf = '';
-
-function getPSProc() {
-  if (psProc && !psProc.killed) return psProc;
-  const { spawn } = require('child_process');
-  psProc = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', '-'], {
-    windowsHide: true,
-    stdio: ['pipe', 'pipe', 'pipe']
-  });
-  psBuf = '';
-  psProc.stdout.on('data', (data) => {
-    psBuf += data.toString();
-    // Each command ends with a newline — resolve pending
-    const lines = psBuf.split('\n');
-    psBuf = lines.pop(); // keep incomplete last line
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed && psQueue.length > 0) {
-        const { resolve } = psQueue.shift();
-        resolve(trimmed);
-      }
-    }
-  });
-  psProc.on('exit', () => {
-    psProc = null;
-    // Resolve any pending with empty
-    while (psQueue.length > 0) psQueue.shift().resolve('{}');
-  });
-  psProc.stderr.on('data', () => {}); // suppress
-  return psProc;
-}
-
-function runPS(script, timeoutMs = 8000) {
+function runPS(script, timeoutMs = 10000) {
   return new Promise((resolve) => {
-    let settled = false;
-    const done = (val) => { if (!settled) { settled = true; resolve(val); } };
-
-    // Timeout guard — if PS never responds, unblock
-    const timer = setTimeout(() => {
-      console.warn('[Agent] PowerShell stats timed out — skipping');
-      // Remove from queue if still pending
-      const idx = psQueue.findIndex(q => q.resolve === done);
-      if (idx !== -1) psQueue.splice(idx, 1);
-      done('{}');
-    }, timeoutMs);
-
-    try {
-      const proc = getPSProc();
-      psQueue.push({ resolve: (val) => { clearTimeout(timer); done(val); } });
-      proc.stdin.write(script.replace(/\r?\n/g, ' ') + '\n');
-    } catch(e) {
-      clearTimeout(timer);
-      done('{}');
-    }
+    const timer = setTimeout(() => resolve('{}'), timeoutMs);
+    exec(
+      `powershell -NoProfile -NonInteractive -Command "${script.replace(/"/g, '\"')}"`,
+      { windowsHide: true, timeout: timeoutMs },
+      (err, stdout) => {
+        clearTimeout(timer);
+        resolve((stdout || '').trim() || '{}');
+      }
+    );
   });
 }
 
 async function getAllStats() {
+  const script = `
+$out = @{}
+try { $t = (Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace root/wmi -EA Stop | Select -First 1).CurrentTemperature; $out.cpuTemp = [math]::Round(($t-2732)/10) } catch { $out.cpuTemp = $null }
+try { $smi = & nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>$null; if ($smi) { $p=$smi.Trim().Split(','); $out.gpu=@{model=$p[0].Trim();temp=[int]$p[1];usage=[int]$p[2];vramUsed=[math]::Round([int]$p[3]/1024,1);vramTotal=[math]::Round([int]$p[4]/1024,1)} } } catch {}
+if (-not $out.gpu) { try { $vc=Get-WmiObject Win32_VideoController -EA Stop|Select -First 1; $out.gpu=@{model=$vc.Name;temp=$null;usage=$null;vramUsed=$null;vramTotal=[math]::Round($vc.AdapterRAM/1GB,1)} } catch { $out.gpu=@{model='N/A';temp=$null;usage=$null;vramUsed=$null;vramTotal=$null} } }
+try { $out.disks=@(Get-WmiObject Win32_LogicalDisk -Filter DriveType=3 -EA Stop|%{$t=[math]::Round($_.Size/1GB,1);$f=[math]::Round($_.FreeSpace/1GB,1);@{drive=$_.DeviceID;total=$t;used=[math]::Round($t-$f,1);free=$f;pct=[math]::Round(($t-$f)/$t*100)}}) } catch { $out.disks=@() }
+try { $out.net=@(Get-NetAdapterStatistics -EA Stop|?{$_.ReceivedBytes -gt 0}|%{@{name=$_.Name;rx=$_.ReceivedBytes;tx=$_.SentBytes}}) } catch { $out.net=@() }
+try { $out.fans=@(Get-WmiObject Win32_Fan -EA Stop|?{$_.DesiredSpeed -gt 0}|%{@{name=$_.Name;rpm=$_.DesiredSpeed}}) } catch { $out.fans=@() }
+$out | ConvertTo-Json -Depth 5 -Compress`.trim();
+
   try {
-    const out = await runPS(ALL_STATS_SCRIPT);
+    const out = await runPS(script);
     return JSON.parse(out);
   } catch(e) {
     return {};
@@ -890,5 +803,6 @@ start().catch(err => {
   console.error('[Agent] Fatal error:', err.message);
   process.exit(1);
 });
+
 
 
