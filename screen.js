@@ -7,7 +7,12 @@ const fs = require('fs');
 const os = require('os');
 
 let nutTree;
-try { nutTree = require('@nut-tree-fork/nut-js'); } catch (e) {
+let NutPoint;
+try {
+  nutTree = require('@nut-tree-fork/nut-js');
+  NutPoint = nutTree.Point;
+  console.log('[Screen] @nut-tree-fork/nut-js loaded OK');
+} catch (e) {
   console.warn('[Screen] @nut-tree-fork/nut-js not available — input disabled');
 }
 
@@ -168,25 +173,23 @@ async function handleInput(data) {
   const { mouse, keyboard, Button, Key } = nutTree;
   try {
     if (data.type === 'mousemove') {
-      await mouse.setPosition({ x: Math.round(data.x), y: Math.round(data.y) });
+      await mouse.setPosition(new NutPoint(Math.round(data.x), Math.round(data.y)));
 
     } else if (data.type === 'mousedown') {
-      // Move first then press so click lands in right spot
-      if (data.x !== undefined) await mouse.setPosition({ x: Math.round(data.x), y: Math.round(data.y) });
+      if (data.x !== undefined) await mouse.setPosition(new NutPoint(Math.round(data.x), Math.round(data.y)));
       await mouse.pressButton(data.button === 2 ? Button.RIGHT : Button.LEFT);
 
     } else if (data.type === 'mouseup') {
       await mouse.releaseButton(data.button === 2 ? Button.RIGHT : Button.LEFT);
 
     } else if (data.type === 'scroll') {
-      const amount = Math.ceil(Math.abs(data.deltaY) / 100);
+      const amount = Math.max(1, Math.ceil(Math.abs(data.deltaY) / 100));
       if (data.deltaY > 0) await mouse.scrollDown(amount);
       else await mouse.scrollUp(amount);
 
     } else if (data.type === 'keydown') {
       const k = mapKey(Key, data.key);
       if (k === null) return { success: true };
-      // Build modifier combo
       const keys = [];
       if (data.ctrl) keys.push(Key.LeftControl);
       if (data.shift) keys.push(Key.LeftShift);
@@ -231,4 +234,5 @@ function mapKey(Key, keyName) {
 }
 
 module.exports = { getMonitors, startStream, stopStream, handleInput };
+
 
