@@ -8,7 +8,6 @@ const path = require('path');
 const { exec } = require('child_process');
 const simpleGit = require('simple-git');
 const express = require('express');
-const WebSocket = require('ws');
 
 // ─── Config ────────────────────────────────────────────────
 const { HUB_URL, AGENT_SECRET, DEVICE_ID, DEVICE_NAME, AGENT_PORT } = process.env;
@@ -226,72 +225,10 @@ app.get('/processes', async (req, res) => {
   }
 });
 
-// ── Remote Terminal (port 3002) — streaming WebSocket ────────────────────────
+// ── Remote Terminal UI (port 3002) ───────────────────────────────────────────
 const termApp = require('express')();
-const termHttp = require('http').createServer(termApp);
-const termWs = new WebSocket.Server({ server: termHttp });
 const TERM_PORT = 3002;
-const { spawn } = require('child_process');
 
-const termSessions = {};
-
-termWs.on('connection', (ws, req) => {
-  const url = new URL('http://x' + req.url);
-  const secret    = url.searchParams.get('secret');
-  const shell     = url.searchParams.get('shell') || 'powershell';
-  const sessionId = url.searchParams.get('session') || Date.now().toString();
-
-  if (secret !== process.env.AGENT_SECRET) {
-    ws.send(JSON.stringify({ type: 'err', data: 'Forbidden\r\n' }));
-    ws.close();
-    return;
-  }
-
-  const shellCmd  = shell === 'cmd' ? 'cmd.exe' : 'powershell.exe';
-  const shellArgs = shell === 'cmd' ? [] : ['-NoLogo', '-NoProfile'];
-
-  const proc = spawn(shellCmd, shellArgs, {
-    cwd: process.env.USERPROFILE || 'C:\\Users\\alexi',
-    env: process.env,
-    windowsHide: true,
-  });
-
-  termSessions[sessionId] = { proc, shell };
-
-  const send = (type, data) => {
-    if (ws.readyState === 1) ws.send(JSON.stringify({ type, data }));
-  };
-
-  proc.stdout.on('data', d => send('out', d.toString()));
-  proc.stderr.on('data', d => send('err', d.toString()));
-  proc.on('close', code => {
-    send('exit', '\r\nProcess exited (' + code + ')\r\n');
-    delete termSessions[sessionId];
-    ws.close();
-  });
-
-  ws.on('message', raw => {
-    try {
-      const msg = JSON.parse(raw);
-      if (msg.type === 'input' && proc.stdin.writable) {
-        proc.stdin.write(msg.data + '\n');
-      } else if (msg.type === 'kill') {
-        try { proc.kill(); } catch(e) {}
-      }
-    } catch(e) {}
-  });
-
-  ws.on('close', () => {
-    try { proc.kill(); } catch(e) {}
-    delete termSessions[sessionId];
-  });
-
-  const hostname = require('os').hostname();
-  send('out', 'Connected to ' + hostname + ' [' + shellCmd + ']\r\n');
-});
-
-// Serve the terminal UI on GET / (same as before, but now backed by WS)
-termApp.use(require('express').json());
 termApp.get('/', (req, res) => {
   if (req.query.secret !== process.env.AGENT_SECRET) {
     return res.status(403).send('<h2>403 Forbidden</h2>');
@@ -301,160 +238,118 @@ termApp.get('/', (req, res) => {
 <html>
 <head>
 <meta charset="UTF-8">
-<title>BouchHub Terminal — ${hostname}</title>
+<title>BouchHub Terminal</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#07070f;color:#e8e8f0;font-family:'Cascadia Code','Fira Code','Courier New',monospace;display:flex;flex-direction:column;height:100vh}
-.header{background:#0e0e1a;border-bottom:1px solid #1a1a2e;padding:10px 20px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
-.logo{font-family:sans-serif;font-weight:800;font-size:16px;letter-spacing:-0.5px}
-.logo span{color:#7c6aff}
-.hostname{font-size:11px;color:#5a5a7a;letter-spacing:1px}
-.toolbar{background:#0e0e1a;border-bottom:1px solid #1a1a2e;padding:6px 12px;display:flex;gap:8px;flex-shrink:0}
-.add-btn{background:none;border:1px solid #1a1a2e;color:#e8e8f0;font-family:inherit;font-size:11px;padding:4px 12px;cursor:pointer;letter-spacing:1px;transition:border-color .15s,color .15s}
-.add-btn:hover{border-color:#7c6aff;color:#7c6aff}
-.add-btn.cmd:hover{border-color:#fbbf24;color:#fbbf24}
-.workspace{flex:1;display:flex;flex-wrap:wrap;overflow:hidden;min-height:0}
-.workspace.c1 .pane{width:100%;height:100%}
-.workspace.c2 .pane{width:50%;height:100%}
-.workspace.c3 .pane:nth-child(1),.workspace.c3 .pane:nth-child(2){width:50%;height:50%}
-.workspace.c3 .pane:nth-child(3){width:100%;height:50%}
-.workspace.c4 .pane{width:50%;height:50%}
-.workspace.c5 .pane,.workspace.c6 .pane{width:33.333%;height:50%}
-.pane{display:flex;flex-direction:column;border:1px solid #1a1a2e;min-height:0;overflow:hidden}
-.pane-title{background:#0e0e1a;border-bottom:1px solid #1a1a2e;padding:0 10px;height:30px;display:flex;align-items:center;gap:8px;flex-shrink:0;font-size:11px;color:#7c6aff;letter-spacing:1px;user-select:none}
-.pane-title span{flex:1}
-.close-btn{background:none;border:none;color:#5a5a7a;font-size:13px;cursor:pointer;padding:2px 5px;line-height:1;transition:color .15s}
-.close-btn:hover{color:#ff6a6a}
-.output{flex:1;overflow-y:auto;padding:10px 14px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-all;background:#07070f}
-.output::-webkit-scrollbar{width:4px}
-.output::-webkit-scrollbar-thumb{background:#1a1a2e}
-.t-out{color:#e8e8f0}.t-err{color:#ff6a6a}.t-cmd{color:#7c6aff}.t-sys{color:#5a5a7a;font-style:italic}.t-exit{color:#5a5a7a}
-.ansi-31{color:#ff6a6a}.ansi-32{color:#4ade80}.ansi-33{color:#fbbf24}.ansi-34{color:#4a8fff}
-.ansi-35{color:#a855f7}.ansi-36{color:#22d3ee}.ansi-37{color:#e8e8f0}.ansi-90{color:#5a5a7a}
-.ansi-91{color:#ff8080}.ansi-92{color:#86efac}.ansi-93{color:#fde68a}.ansi-94{color:#7c6aff}
-.ansi-95{color:#c084fc}.ansi-96{color:#67e8f9}.ansi-1{font-weight:bold}
-.input-row{display:flex;align-items:center;background:#0e0e1a;border-top:1px solid #1a1a2e;padding:6px 10px;gap:8px;flex-shrink:0}
-.prompt{color:#7c6aff;font-size:12px;flex-shrink:0}
-.cmd-input{flex:1;background:transparent;border:none;color:#e8e8f0;font-family:inherit;font-size:13px;outline:none}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #07070f; color: #e8e8f0; font-family: 'Courier New', monospace; display: flex; flex-direction: column; height: 100vh; }
+.header { background: #0e0e1a; border-bottom: 1px solid #1a1a2e; padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+.logo { font-family: sans-serif; font-weight: 800; font-size: 16px; }
+.logo span { color: #7c6aff; }
+.hostname { font-size: 11px; color: #5a5a7a; letter-spacing: 1px; }
+#output { flex: 1; overflow-y: auto; padding: 12px 20px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+#output::-webkit-scrollbar { width: 4px; }
+#output::-webkit-scrollbar-thumb { background: #1a1a2e; }
+.line.out { color: #e8e8f0; }
+.line.err { color: #ff6a6a; }
+.line.cmd { color: #7c6aff; }
+.cwd { font-size: 11px; color: #5a5a7a; padding: 4px 20px 8px; background: #0e0e1a; border-top: 1px solid #1a1a2e; flex-shrink: 0; }
+.input-row { display: flex; align-items: center; background: #0e0e1a; border-top: 1px solid #1a1a2e; padding: 8px 20px; gap: 8px; flex-shrink: 0; }
+.prompt { color: #7c6aff; flex-shrink: 0; font-size: 13px; }
+#cmdInput { flex: 1; background: transparent; border: none; color: #e8e8f0; font-family: inherit; font-size: 13px; outline: none; }
 </style>
 </head>
 <body>
 <div class="header">
   <div class="logo">Bouch<span>Hub</span></div>
-  <div class="hostname">TERMINAL — ${hostname.toUpperCase()}</div>
+  <div class="hostname">Terminal — ${hostname}</div>
 </div>
-<div class="toolbar">
-  <button class="add-btn" onclick="addPane('powershell')">+ PowerShell</button>
-  <button class="add-btn cmd" onclick="addPane('cmd')">+ CMD</button>
+<div id="output"><div class="line out">Connected to ${hostname}. Type commands below.</div></div>
+<div class="cwd" id="cwd">PS &gt; ${process.cwd()}</div>
+<div class="input-row">
+  <div class="prompt">PS &gt;</div>
+  <input id="cmdInput" autofocus placeholder="Enter command..." autocomplete="off">
 </div>
-<div class="workspace" id="ws"></div>
 <script>
-const SECRET = new URLSearchParams(location.search).get('secret');
-const HOST = location.host;
-const PROTO = location.protocol === 'https:' ? 'wss:' : 'ws:';
-let paneCount = 0;
-const panes = {};
+const secret = new URLSearchParams(location.search).get('secret');
+let cwd = ${JSON.stringify(process.env.USERPROFILE || 'C:\\Users\\alexi')};
+const output = document.getElementById('output');
+const input = document.getElementById('cmdInput');
+const cwdEl = document.getElementById('cwd');
+const history = [];
+let histIdx = -1;
 
-function updateLayout() {
-  const w = document.getElementById('ws');
-  const n = w.children.length;
-  w.className = 'workspace c' + Math.min(n, 6);
+function addLine(text, cls) {
+  const d = document.createElement('div');
+  d.className = 'line ' + cls;
+  d.textContent = text;
+  output.appendChild(d);
+  output.scrollTop = output.scrollHeight;
 }
 
-function ansiToHtml(text) {
-  text = text.replace(/\r\n/g,'\n').replace(/\r/g,'\n');
-  const map={'31':'ansi-31','32':'ansi-32','33':'ansi-33','34':'ansi-34','35':'ansi-35','36':'ansi-36','37':'ansi-37','90':'ansi-90','91':'ansi-91','92':'ansi-92','93':'ansi-93','94':'ansi-94','95':'ansi-95','96':'ansi-96','1':'ansi-1','0':''};
-  let html='',open=false;
-  const parts=text.split(/\x1b\[([0-9;]*)m/);
-  for(let i=0;i<parts.length;i++){
-    if(i%2===0){html+=parts[i].replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-    else{
-      if(open){html+='</span>';open=false;}
-      const cls=parts[i].split(';').map(c=>map[c]).filter(Boolean).join(' ');
-      if(cls){html+='<span class="'+cls+'">'; open=true;}
-    }
-  }
-  if(open)html+='</span>';
-  return html;
-}
-
-function addPane(shell) {
-  const id = ++paneCount;
-  const sid = 'p' + id + '-' + Date.now();
-  const label = shell === 'cmd' ? 'CMD' : 'PowerShell';
-
-  const pane = document.createElement('div');
-  pane.className = 'pane';
-  pane.id = 'pane-' + id;
-  pane.innerHTML = \`
-    <div class="pane-title">
-      <span>\${label}</span>
-      <button class="close-btn" onclick="closePane(\${id})">✕</button>
-    </div>
-    <div class="output" id="out-\${id}"></div>
-    <div class="input-row">
-      <span class="prompt" id="pr-\${id}">\${shell==='cmd'?'C:\\>':'PS >'}</span>
-      <input class="cmd-input" id="in-\${id}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Type a command...">
-    </div>
-  \`;
-  document.getElementById('ws').appendChild(pane);
-  updateLayout();
-
-  const ws = new WebSocket(\`\${PROTO}//\${HOST}/?secret=\${encodeURIComponent(SECRET)}&shell=\${shell}&session=\${sid}\`);
-  const out = document.getElementById('out-' + id);
-  const inp = document.getElementById('in-' + id);
-  const hist = []; let hidx = -1;
-
-  function append(text, cls) {
-    const d = document.createElement('div');
-    d.className = cls;
-    d.innerHTML = ansiToHtml(text);
-    out.appendChild(d);
-    out.scrollTop = out.scrollHeight;
-  }
-
-  ws.onopen = () => append('Connecting...', 't-sys');
-  ws.onmessage = e => {
-    try {
-      const m = JSON.parse(e.data);
-      if(m.type==='out') append(m.data,'t-out');
-      if(m.type==='err') append(m.data,'t-err');
-      if(m.type==='exit') append(m.data,'t-exit');
-    } catch(_) {}
-  };
-  ws.onerror = () => append('Connection error','t-err');
-  ws.onclose = () => append('\nSession closed.','t-sys');
-
-  inp.addEventListener('keydown', e => {
-    if(e.key==='ArrowUp'){if(hidx<hist.length-1){hidx++;inp.value=hist[hidx];}e.preventDefault();return;}
-    if(e.key==='ArrowDown'){if(hidx>0){hidx--;inp.value=hist[hidx];}else{hidx=-1;inp.value='';}e.preventDefault();return;}
-    if(e.key!=='Enter')return;
-    const cmd=inp.value; if(!cmd.trim())return;
-    hist.unshift(cmd); hidx=-1; inp.value='';
-    append((shell==='cmd'?'C:\\> ':'PS > ')+cmd,'t-cmd');
-    if(ws.readyState===1) ws.send(JSON.stringify({type:'input',data:cmd}));
-    else append('Not connected','t-err');
-  });
-  inp.focus();
-  panes[id] = ws;
-}
-
-function closePane(id) {
-  try{panes[id]?.send(JSON.stringify({type:'kill'}));panes[id]?.close();}catch(_){}
-  delete panes[id];
-  document.getElementById('pane-'+id)?.remove();
-  updateLayout();
-}
-
-// Open one PowerShell pane by default
-addPane('powershell');
+input.addEventListener('keydown', async (e) => {
+  if (e.key === 'ArrowUp') { if (histIdx < history.length-1) { histIdx++; input.value = history[histIdx]; } e.preventDefault(); return; }
+  if (e.key === 'ArrowDown') { if (histIdx > 0) { histIdx--; input.value = history[histIdx]; } else { histIdx = -1; input.value = ''; } e.preventDefault(); return; }
+  if (e.key !== 'Enter') return;
+  const cmd = input.value.trim();
+  if (!cmd) return;
+  history.unshift(cmd);
+  histIdx = -1;
+  input.value = '';
+  addLine('PS > ' + cmd, 'cmd');
+  try {
+    const r = await fetch('/terminal/run?secret=' + encodeURIComponent(secret), {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ command: cmd, cwd })
+    });
+    const d = await r.json();
+    if (d.output) addLine(d.output, 'out');
+    if (d.error) addLine(d.error, 'err');
+    if (d.cwd) { cwd = d.cwd; cwdEl.textContent = 'PS > ' + cwd; }
+  } catch(e) { addLine('Error: ' + e.message, 'err'); }
+});
 </script>
 </body>
 </html>`);
 });
 
-termHttp.listen(TERM_PORT, '0.0.0.0', () => {
-  console.log('[Agent] Terminal on port ' + TERM_PORT);
+termApp.use(require('express').json());
+
+termApp.post('/terminal/run', async (req, res) => {
+  if (req.query.secret !== process.env.AGENT_SECRET) return res.status(403).json({ error: 'Forbidden' });
+  const { command, cwd } = req.body;
+  if (!command) return res.status(400).json({ error: 'No command' });
+
+  if (command.trim().toLowerCase().startsWith('cd ')) {
+    const newDir = command.trim().slice(3).trim();
+    const resolved = require('path').resolve(cwd || process.cwd(), newDir);
+    try {
+      require('fs').accessSync(resolved);
+      return res.json({ output: '', cwd: resolved });
+    } catch { return res.json({ error: 'Directory not found: ' + resolved, cwd }); }
+  }
+
+  try {
+    const output = await new Promise((resolve, reject) => {
+      exec(command, {
+        shell: 'powershell.exe',
+        cwd: cwd || process.cwd(),
+        timeout: 60000,
+        maxBuffer: 2 * 1024 * 1024,
+        windowsHide: true,
+      }, (err, stdout, stderr) => {
+        if (err && !stdout && !stderr) return reject(err);
+        resolve({ stdout: stdout || '', stderr: stderr || '' });
+      });
+    });
+    res.json({ output: (output.stdout + output.stderr).trim(), cwd: cwd || process.cwd() });
+  } catch (e) {
+    res.json({ error: e.message, cwd: cwd || process.cwd() });
+  }
+});
+
+termApp.listen(TERM_PORT, '0.0.0.0', () => {
+  console.log('[Agent] Remote terminal available at http://<ip>:' + TERM_PORT + '/?secret=<AGENT_SECRET>');
 });
 
 // Run any shell command
