@@ -8,6 +8,7 @@ const path = require('path');
 const { exec } = require('child_process');
 const simpleGit = require('simple-git');
 const express = require('express');
+const WebSocket = require('ws');
 
 // ─── Config ────────────────────────────────────────────────
 const { HUB_URL, AGENT_SECRET, DEVICE_ID, DEVICE_NAME, AGENT_PORT } = process.env;
@@ -225,131 +226,72 @@ app.get('/processes', async (req, res) => {
   }
 });
 
-// ── Remote Terminal UI (port 3002) ───────────────────────────────────────────
+// ── Remote Terminal (port 3002) — streaming WebSocket ────────────────────────
 const termApp = require('express')();
+const termHttp = require('http').createServer(termApp);
+const termWs = new WebSocket.Server({ server: termHttp });
 const TERM_PORT = 3002;
+const { spawn } = require('child_process');
 
-termApp.get('/', (req, res) => {
-  // Simple auth via agent secret in URL query
-  if (req.query.secret !== process.env.AGENT_SECRET) {
-    return res.status(403).send('<h2>403 Forbidden</h2>');
+const termSessions = {};
+
+termWs.on('connection', (ws, req) => {
+  const url = new URL('http://x' + req.url);
+  const secret    = url.searchParams.get('secret');
+  const shell     = url.searchParams.get('shell') || 'powershell';
+  const sessionId = url.searchParams.get('session') || Date.now().toString();
+
+  if (secret !== process.env.AGENT_SECRET) {
+    ws.send(JSON.stringify({ type: 'err', data: 'Forbidden\r\n' }));
+    ws.close();
+    return;
   }
-  res.send(`<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BouchHub Terminal — ${require('os').hostname()}</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#0a0a0f;color:#e8e8f0;font-family:'Courier New',monospace;height:100vh;display:flex;flex-direction:column}
-.header{background:#111118;border-bottom:1px solid #1e1e2e;padding:12px 20px;display:flex;align-items:center;gap:12px;flex-shrink:0}
-.logo{font-weight:700;font-size:16px;color:#7c6aff}
-.hostname{font-size:12px;color:#5a5a7a}
-#output{flex:1;overflow-y:auto;padding:16px 20px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-all}
-.line{margin-bottom:2px}
-.line.cmd{color:#7c6aff}
-.line.out{color:#e8e8f0}
-.line.err{color:#ff6a6a}
-.input-row{display:flex;align-items:center;padding:12px 20px;background:#111118;border-top:1px solid #1e1e2e;gap:10px;flex-shrink:0}
-.prompt{color:#7c6aff;flex-shrink:0;font-size:13px}
-#cmdInput{flex:1;background:transparent;border:none;color:#e8e8f0;font-family:inherit;font-size:13px;outline:none}
-.cwd{font-size:11px;color:#5a5a7a;padding:4px 20px 8px;background:#111118}
-</style>
-</head>
-<body>
-<div class="header">
-  <div class="logo">BouchHub</div>
-  <div class="hostname">Terminal — ${require('os').hostname()}</div>
-</div>
-<div id="output"><div class="line out">Connected to ${require('os').hostname()}. Type commands below.</div></div>
-<div class="cwd" id="cwd">PS &gt; ${process.cwd()}</div>
-<div class="input-row">
-  <div class="prompt">PS &gt;</div>
-  <input id="cmdInput" autofocus placeholder="Enter command..." autocomplete="off">
-</div>
-<script>
-const secret = new URLSearchParams(location.search).get('secret');
-let cwd = ${JSON.stringify(process.env.USERPROFILE || 'C:\\Users\\alexi')};
-const output = document.getElementById('output');
-const input = document.getElementById('cmdInput');
-const cwdEl = document.getElementById('cwd');
-const history = [];
-let histIdx = -1;
 
-function addLine(text, cls) {
-  const d = document.createElement('div');
-  d.className = 'line ' + cls;
-  d.textContent = text;
-  output.appendChild(d);
-  output.scrollTop = output.scrollHeight;
-}
+  const shellCmd  = shell === 'cmd' ? 'cmd.exe' : 'powershell.exe';
+  const shellArgs = shell === 'cmd' ? [] : ['-NoLogo', '-NoProfile'];
 
-input.addEventListener('keydown', async (e) => {
-  if (e.key === 'ArrowUp') { if (histIdx < history.length-1) { histIdx++; input.value = history[histIdx]; } e.preventDefault(); return; }
-  if (e.key === 'ArrowDown') { if (histIdx > 0) { histIdx--; input.value = history[histIdx]; } else { histIdx = -1; input.value = ''; } e.preventDefault(); return; }
-  if (e.key !== 'Enter') return;
-  const cmd = input.value.trim();
-  if (!cmd) return;
-  history.unshift(cmd);
-  histIdx = -1;
-  input.value = '';
-  addLine('PS > ' + cmd, 'cmd');
-  try {
-    const r = await fetch('/terminal/run?secret=' + encodeURIComponent(secret), {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ command: cmd, cwd })
-    });
-    const d = await r.json();
-    if (d.output) addLine(d.output, 'out');
-    if (d.error) addLine(d.error, 'err');
-    if (d.cwd) { cwd = d.cwd; cwdEl.textContent = 'PS > ' + cwd; }
-  } catch(e) { addLine('Error: ' + e.message, 'err'); }
-});
-</script>
-</body>
-</html>`);
-});
+  const proc = spawn(shellCmd, shellArgs, {
+    cwd: process.env.USERPROFILE || 'C:\\Users\\alexi',
+    env: process.env,
+    windowsHide: true,
+  });
 
-termApp.use(require('express').json());
+  termSessions[sessionId] = { proc, shell };
 
-termApp.post('/terminal/run', async (req, res) => {
-  if (req.query.secret !== process.env.AGENT_SECRET) return res.status(403).json({ error: 'Forbidden' });
-  const { command, cwd } = req.body;
-  if (!command) return res.status(400).json({ error: 'No command' });
+  const send = (type, data) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type, data }));
+  };
 
-  // Handle cd specially so cwd persists
-  if (command.trim().toLowerCase().startsWith('cd ')) {
-    const newDir = command.trim().slice(3).trim();
-    const resolved = require('path').resolve(cwd || process.cwd(), newDir);
+  proc.stdout.on('data', d => send('out', d.toString()));
+  proc.stderr.on('data', d => send('err', d.toString()));
+  proc.on('close', code => {
+    send('exit', '\r\nProcess exited (' + code + ')\r\n');
+    delete termSessions[sessionId];
+    ws.close();
+  });
+
+  ws.on('message', raw => {
     try {
-      require('fs').accessSync(resolved);
-      return res.json({ output: '', cwd: resolved });
-    } catch { return res.json({ error: 'Directory not found: ' + resolved, cwd }); }
-  }
+      const msg = JSON.parse(raw);
+      if (msg.type === 'input' && proc.stdin.writable) {
+        proc.stdin.write(msg.data + '\n');
+      } else if (msg.type === 'kill') {
+        try { proc.kill(); } catch(e) {}
+      }
+    } catch(e) {}
+  });
 
-  try {
-    const output = await new Promise((resolve, reject) => {
-      exec(command, {
-        shell: 'powershell.exe',
-        cwd: cwd || process.cwd(),
-        timeout: 60000,
-        maxBuffer: 2 * 1024 * 1024,
-        windowsHide: true,
-      }, (err, stdout, stderr) => {
-        if (err && !stdout && !stderr) return reject(err);
-        resolve({ stdout: stdout || '', stderr: stderr || '' });
-      });
-    });
-    res.json({ output: (output.stdout + output.stderr).trim(), cwd: cwd || process.cwd() });
-  } catch (e) {
-    res.json({ error: e.message, cwd: cwd || process.cwd() });
-  }
+  ws.on('close', () => {
+    try { proc.kill(); } catch(e) {}
+    delete termSessions[sessionId];
+  });
+
+  const hostname = require('os').hostname();
+  send('out', 'Connected to ' + hostname + ' [' + shellCmd + ']\r\n');
 });
 
-termApp.listen(TERM_PORT, '0.0.0.0', () => {
-  console.log('[Agent] Remote terminal available at http://<ip>:' + TERM_PORT + '/?secret=<AGENT_SECRET>');
+termHttp.listen(TERM_PORT, '0.0.0.0', () => {
+  console.log('[Agent] Terminal WS on port ' + TERM_PORT);
 });
 
 // Run any shell command
