@@ -42,6 +42,22 @@ let updateTimer = null;
 let statsTimer = null;
 let isShuttingDown = false;
 
+// Point a hub-provided callback URL at the SAME hub base this agent already uses
+// for heartbeats. The hub historically defaulted the screen-frame callbackUrl to
+// 127.0.0.1, which only reaches the hub when the agent runs ON the hub machine —
+// so remote devices' screens never showed. HUB_URL is proven-good (we heartbeat
+// to it), so keep only the path from the callback and re-base it onto HUB_URL.
+function rebaseToHub(callbackUrl) {
+  try {
+    const cb = new URL(callbackUrl);
+    const hub = new URL(HUB_URL);
+    cb.protocol = hub.protocol;
+    cb.hostname = hub.hostname;
+    cb.port = hub.port; // '' for default ports (443/80), clears any stray port
+    return cb.toString();
+  } catch { return callbackUrl; }
+}
+
 // ─── Stats Cache ───────────────────────────────────────────
 let cachedStats = {
   cpu: { usage: 0, temp: null, model: '', cores: 0 },
@@ -608,8 +624,9 @@ app.get('/screen/monitors', async (req, res) => {
 // POST /screen/start — begin streaming frames to hub
 app.post('/screen/start', async (req, res) => {
   if (!screenModule) return res.status(503).json({ error: 'screen module not available' });
-  const { monitorIndex, callbackUrl, agentSecret, fps } = req.body;
-  if (!callbackUrl) return res.status(400).json({ error: 'callbackUrl required' });
+  const { monitorIndex, agentSecret, fps } = req.body;
+  if (!req.body.callbackUrl) return res.status(400).json({ error: 'callbackUrl required' });
+  const callbackUrl = rebaseToHub(req.body.callbackUrl);
   try {
     const result = await screenModule.startStream({ monitorIndex: monitorIndex || 0, callbackUrl, agentSecret, fps });
     // Notify the Electron tray to show sharing notification

@@ -17,7 +17,10 @@ try {
 }
 
 const TMP_DIR = path.join(os.tmpdir(), 'bouchhub-screen');
-try { fs.mkdirSync(TMP_DIR, { recursive: true }); } catch (_) {}
+// Re-create on demand: %TEMP% can be wiped by disk cleanup, and if we only made
+// this at startup, later script writes fail with ENOENT. Call before each write.
+function ensureTmp() { try { fs.mkdirSync(TMP_DIR, { recursive: true }); } catch (_) {} }
+ensureTmp();
 
 // Find FFmpeg — check PATH first, then common install locations
 function findFFmpeg() {
@@ -85,6 +88,7 @@ let monitors = null;
 // ── Monitor listing via PowerShell .ps1 file ─────────────────
 async function getMonitors() {
   return new Promise((resolve) => {
+    ensureTmp();
     const ps1 = path.join(TMP_DIR, 'list_monitors.ps1');
     fs.writeFileSync(ps1, `
 Add-Type -AssemblyName System.Windows.Forms
