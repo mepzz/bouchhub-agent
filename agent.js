@@ -118,6 +118,8 @@ if (-not $out.gpu) { try { $vc=Get-WmiObject Win32_VideoController -EA Stop|Sele
 try { $out.disks=@(Get-WmiObject Win32_LogicalDisk -Filter DriveType=3 -EA Stop|%{$t=[math]::Round($_.Size/1GB,1);$f=[math]::Round($_.FreeSpace/1GB,1);@{drive=$_.DeviceID;total=$t;used=[math]::Round($t-$f,1);free=$f;pct=[math]::Round(($t-$f)/$t*100)}}) } catch { $out.disks=@() }
 try { $out.net=@(Get-NetAdapterStatistics -EA Stop|?{$_.ReceivedBytes -gt 0}|%{@{name=$_.Name;rx=$_.ReceivedBytes;tx=$_.SentBytes}}) } catch { $out.net=@() }
 try { $out.fans=@(Get-WmiObject Win32_Fan -EA Stop|?{$_.DesiredSpeed -gt 0}|%{@{name=$_.Name;rpm=$_.DesiredSpeed}}) } catch { $out.fans=@() }
+try { $out.smart=@(Get-PhysicalDisk -EA Stop|%{@{name=$_.FriendlyName;status=[string]$_.HealthStatus}}) } catch { $out.smart=@() }
+try { $b=Get-WmiObject Win32_Battery -EA Stop|Select -First 1; if ($b) { $out.battery=@{pct=[int]$b.EstimatedChargeRemaining;status=[int]$b.BatteryStatus} } } catch {}
 $out | ConvertTo-Json -Depth 5 -Compress`.trim();
 
   try {
@@ -168,6 +170,10 @@ async function collectStats() {
     disks: psStats.disks ?? [],
     network,
     fans: psStats.fans ?? [],
+    // Hardware health: SMART status per physical disk, battery charge/status.
+    // Sentinel watches these for slow-degrade failures.
+    smart: psStats.smart ?? [],
+    battery: psStats.battery ?? null,
     uptime: Math.floor(os.uptime()),
     timestamp: Date.now()
   };
