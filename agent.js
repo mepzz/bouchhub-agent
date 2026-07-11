@@ -442,6 +442,25 @@ app.post('/browser/navigate', async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Search a selling platform (facebook | kijiji | ebay) for recent listings,
+// using the logged-in BouchHub Chrome profile. Powers hub-side Item Hunts.
+app.post('/browser/marketplace/search', async (req, res) => {
+  if (!browserModule) return res.status(503).json({ error: 'Playwright not installed' });
+  const { platform, query, options } = req.body || {};
+  if (!platform || !query) return res.status(400).json({ error: 'platform and query required' });
+  try { res.json(await browserModule.marketplaceSearch(platform, query, options || {})); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Read the visible text + metadata of a single page (for parsing a pasted link).
+app.post('/browser/extract', async (req, res) => {
+  if (!browserModule) return res.status(503).json({ error: 'Playwright not installed' });
+  const { url } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'url required' });
+  try { res.json(await browserModule.extractPage(url)); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/browser/instagram/login', async (req, res) => {
   if (!browserModule) return res.status(503).json({ error: 'Playwright not installed' });
   const username = process.env.INSTAGRAM_USERNAME;

@@ -150,6 +150,124 @@ async function navigate(url) {
   return { url: page.url(), title: await page.title() };
 }
 
+// ─── Marketplace search ────────────────────────────────────
+// Search selling platforms for recent listings and return clean listing cards:
+//   [{ id, title, price, url, image, location }]
+// Runs in the BouchHub Chrome window, which shares the user's logged-in
+// cookies — so Facebook Marketplace works without a separate login. Facebook
+// is sorted newest-first; the others default to their recency sort. DOM
+// scraping is best-effort and defensive: selectors drift, so we pull from
+// anchor hrefs + nearby text rather than brittle class names.
+
+function buildSearchUrl(platform, query, opts = {}) {
+  const q = encodeURIComponent(query);
+  const max = opts.maxPrice ? Math.ceil(opts.maxPrice) : null;
+  switch (platform) {
+    case 'facebook': {
+      // creation_time_descend = newest first. location slug defaults to the
+      // account's own area when omitted, which is what we want.
+      const loc = opts.fbLocation || '';
+      const params = [`query=${q}`, 'sortBy=creation_time_descend'];
+      if (max) params.push(`maxPrice=${max}`);
+      if (opts.radiusKm) params.push(`radius=${Math.round(opts.radiusKm * 1000)}`);
+      return `https://www.facebook.com/marketplace/${loc ? loc + '/' : ''}search?${params.join('&')}`;
+    }
+    case 'kijiji':
+      // Kijiji Canada full-text search, sorted by date (newest).
+      return `https://www.kijiji.ca/b-buy-sell/canada/${q}/k0c10l0?sort=dateDesc${max ? `&price=__${max}` : ''}`;
+    case 'ebay':
+      // eBay.ca, Buy-It-Now-ish, sorted newest (_sop=10), CAD site.
+      return `https://www.ebay.ca/sch/i.html?_nkw=${q}&_sop=10${max ? `&_udhi=${max}` : ''}`;
+    default:
+      throw new Error(`unknown platform: ${platform}`);
+  }
+}
+
+async function marketplaceSearch(platform, query, opts = {}) {
+  const { page } = await launchBrowser();
+  const url = buildSearchUrl(platform, query, opts);
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
+  // Listings hydrate client-side; give them a moment and nudge lazy loaders.
+  await page.waitForTimeout(3500);
+  try { await page.mouse.wheel(0, 2400); await page.waitForTimeout(1500); } catch (_) {}
+
+  const items = await page.evaluate((platform) => {
+    const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+    const priceFrom = txt => {
+      const m = clean(txt).match(/\$[\d,]+(?:\.\d{2})?/);
+      return m ? parseFloat(m[0].replace(/[$,]/g, '')) : null;
+    };
+    const out = [];
+    const seen = new Set();
+
+    if (platform === 'facebook') {
+      for (const a of document.querySelectorAll('a[href*="/marketplace/item/"]')) {
+        const m = a.getAttribute('href').match(/\/marketplace\/item\/(\d+)/);
+        if (!m || seen.has(m[1])) continue;
+        const text = clean(a.innerText);
+        if (!text) continue;
+        const img = a.querySelector('img');
+        // FB card text is usually "$price\nTitle\nLocation"
+        const lines = text.split('\n').map(clean).filter(Boolean);
+        const price = priceFrom(text);
+        const title = lines.find(l => !l.startsWith('$')) || text;
+        seen.add(m[1]);
+        out.push({ id: 'fb_' + m[1], title, price, url: 'https://www.facebook.com/marketplace/item/' + m[1], image: img ? img.src : null, location: lines[lines.length - 1] || null });
+      }
+    } else if (platform === 'kijiji') {
+      for (const a of document.querySelectorAll('a[data-testid="listing-link"], a[href*="/v-"]')) {
+        const href = a.getAttribute('href') || '';
+        const m = href.match(/\/(\d{7,})(?:\?|$|\/)/) || href.match(/-(\d{7,})$/);
+        const id = m ? m[1] : href;
+        if (!id || seen.has(id)) continue;
+        const card = a.closest('[data-testid="listing-card"], li, article') || a;
+        const title = clean(a.innerText) || clean(card.querySelector('h3, [class*="title"]')?.innerText);
+        if (!title) continue;
+        const img = card.querySelector('img');
+        seen.add(id);
+        out.push({ id: 'kj_' + id, title, price: priceFrom(card.innerText), url: href.startsWith('http') ? href : 'https://www.kijiji.ca' + href, image: img ? (img.src || img.getAttribute('data-src')) : null, location: null });
+      }
+    } else if (platform === 'ebay') {
+      for (const li of document.querySelectorAll('li.s-item, li[data-viewport]')) {
+        const a = li.querySelector('a.s-item__link, a[href*="/itm/"]');
+        if (!a) continue;
+        const m = (a.getAttribute('href') || '').match(/\/itm\/(\d+)/);
+        const id = m ? m[1] : null;
+        if (!id || seen.has(id)) continue;
+        const title = clean(li.querySelector('.s-item__title, [role="heading"]')?.innerText);
+        if (!title || /shop on ebay/i.test(title)) continue;
+        const img = li.querySelector('img');
+        seen.add(id);
+        out.push({ id: 'eb_' + id, title, price: priceFrom(li.querySelector('.s-item__price')?.innerText || li.innerText), url: 'https://www.ebay.ca/itm/' + id, image: img ? (img.src || img.getAttribute('data-src')) : null, location: null });
+      }
+    }
+    return out.slice(0, 40);
+  }, platform);
+
+  return { platform, url, count: items.length, items };
+}
+
+// Fetch the readable text of a single item/product page (for link parsing).
+async function extractPage(url) {
+  const { page } = await launchBrowser();
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
+  await page.waitForTimeout(2500);
+  return page.evaluate(() => {
+    const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+    const og = p => document.querySelector(`meta[property="og:${p}"]`)?.content || null;
+    return {
+      url: location.href,
+      title: clean(document.title),
+      ogTitle: og('title'),
+      ogPrice: document.querySelector('meta[property="product:price:amount"]')?.content
+            || document.querySelector('meta[property="og:price:amount"]')?.content || null,
+      ogImage: og('image'),
+      // First ~4000 chars of visible text is plenty for Claude to parse.
+      text: clean(document.body ? document.body.innerText : '').slice(0, 4000),
+    };
+  });
+}
+
 // ─── Instagram Login ───────────────────────────────────────
 async function instagramLogin(username, password) {
   const { page } = await launchBrowser();
@@ -354,6 +472,7 @@ async function screenshot() {
 module.exports = {
   launchBrowser, closeBrowser, navigate,
   instagramLogin, instagramSendDM,
+  marketplaceSearch, extractPage, buildSearchUrl,
   getPageInfo, screenshot,
   isOpen: () => !!activeBrowser,
 };
