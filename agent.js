@@ -461,6 +461,27 @@ app.post('/browser/extract', async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Claude Code autopilot (uses the owner's Max plan on this machine) ─────────
+let claudeModule;
+try { claudeModule = require('./claude'); } catch (e) { console.warn('[Agent] claude module unavailable:', e.message); }
+
+// Read current Max session usage %, so the hub can gate work on the cutoff.
+app.post('/claude/status', async (req, res) => {
+  if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });
+  try { res.json(await claudeModule.status()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Launch a detached Claude Code session with a handoff prompt, auto-accepting
+// permissions, working in the given folder (default Downloads/BouchHub2).
+app.post('/claude/work', async (req, res) => {
+  if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });
+  const { prompt, cwd, autoAccept } = req.body || {};
+  if (!prompt) return res.status(400).json({ error: 'prompt required' });
+  try { res.json(claudeModule.work({ prompt, cwd, autoAccept: autoAccept !== false })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/browser/instagram/login', async (req, res) => {
   if (!browserModule) return res.status(503).json({ error: 'Playwright not installed' });
   const username = process.env.INSTAGRAM_USERNAME;
