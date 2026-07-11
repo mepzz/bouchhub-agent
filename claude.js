@@ -123,22 +123,48 @@ function parseUsage(text) {
   return { usedPct, resetsInMin, raw: t.slice(0, 500) };
 }
 
+// Detect a "usage limit reached / rate limited" message and its reset time.
+function parseLimit(text) {
+  const t = (text || '').replace(/\[[0-9;]*m/g, '');
+  const limited = /usage limit|rate.?limit|limit reached|limit will reset|you(?:'ve| have) reached/i.test(t);
+  if (!limited) return { limited: false, resetsInMin: null };
+  const { resetsInMin } = parseUsage(t);
+  return { limited: true, resetsInMin };
+}
+
+// Report whether Autopilot may run right now.
+//   usedPct     — the Max session % if we can read it (usually null: the CLI
+//                 only shows it in the interactive /usage panel, not to scripts)
+//   limited     — Claude is currently rate-limited (hard stop)
+//   resetsInMin — when the limit lifts, if known
+// Because the exact % isn't scriptable, the hub gates on `limited`: run when
+// not limited, wait for the reset when we are.
 async function status() {
   const bin = await resolveClaude();
-  if (!bin) return { usedPct: null, resetsInMin: null, raw: 'Claude Code not found on this PC' };
-  // `claude usage` isn't a stable subcommand across versions; try a couple of
-  // ways and parse whatever prints. All are read-only.
-  const attempts = [
-    [bin, ['usage']],
-    [bin, ['--print', '/usage']],
-    [bin, ['-p', '"/usage"']],
-  ];
-  for (const [cmd, args] of attempts) {
-    const r = await run(cmd, args, { timeoutMs: 30000 });
-    const parsed = parseUsage(`${r.out}\n${r.err}`);
-    if (parsed.usedPct != null) return parsed;
+  if (!bin) return { usedPct: null, resetsInMin: null, limited: false, readable: false, raw: 'Claude Code not found on this PC' };
+
+  // 1) Best-effort read of the session % (works only if a future CLI exposes it).
+  let usedPct = null, resetsInMin = null, raw = '';
+  for (const args of [['-p', '/usage'], ['usage']]) {
+    const r = await run(bin, args, { timeoutMs: 30000 });
+    raw = `${r.out}\n${r.err}`.trim();
+    const p = parseUsage(raw);
+    if (p.usedPct != null) { usedPct = p.usedPct; resetsInMin = p.resetsInMin; break; }
   }
-  return { usedPct: null, resetsInMin: null, raw: 'could not read usage' };
+  if (usedPct != null) return { usedPct, resetsInMin, limited: usedPct >= 100, readable: true, raw: raw.slice(0, 300) };
+
+  // 2) No %: probe whether we're rate-limited right now with a tiny request.
+  const probe = await run(bin, ['-p', 'ok', '--output-format', 'json'], { timeoutMs: 45000 });
+  const text = `${probe.out}\n${probe.err}`;
+  let apiError = null;
+  try { const j = JSON.parse(probe.out); apiError = j.api_error_status; } catch (_) {}
+  const lim = parseLimit(text);
+  const limited = lim.limited || apiError === 429 || /429/.test(String(apiError || ''));
+  return {
+    usedPct: null, readable: false, limited,
+    resetsInMin: lim.resetsInMin,
+    raw: (limited ? text : 'not rate-limited').slice(0, 300),
+  };
 }
 
 // Launch a working session in its own terminal window, detached, so it keeps
@@ -208,4 +234,4 @@ function consoleTail(lines = 250) {
   } catch (e) { return { lines: [], note: e.message }; }
 }
 
-module.exports = { status, work, parseUsage, preflight, consoleTail, LOG_PATH };
+module.exports = { status, work, parseUsage, parseLimit, preflight, consoleTail, LOG_PATH };
