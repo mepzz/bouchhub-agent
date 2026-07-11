@@ -178,10 +178,26 @@ function buildSearchUrl(platform, query, opts = {}) {
     case 'ebay':
       // eBay.ca, Buy-It-Now-ish, sorted newest (_sop=10), CAD site.
       return `https://www.ebay.ca/sch/i.html?_nkw=${q}&_sop=10${max ? `&_udhi=${max}` : ''}`;
+    // ── Retail / online stores (new + open-box) ──
+    case 'amazon':          return `https://www.amazon.ca/s?k=${q}`;
+    case 'bestbuy':         return `https://www.bestbuy.ca/en-ca/search?search=${q}`;
+    case 'walmart':         return `https://www.walmart.ca/en/search?q=${q}`;
+    case 'newegg':          return `https://www.newegg.ca/p/pl?d=${q}`;
+    case 'staples':         return `https://www.staples.ca/search?query=${q}`;
+    case 'canadacomputers': return `https://www.canadacomputers.com/en/search?s=${q}`;
+    case 'ebgames':         return `https://www.ebgames.ca/search?q=${q}`;
+    case 'brand':
+      // The item's own brand store — the hub passes a full search URL it built
+      // from the parsed brand (opts.brandUrl). No generic fallback.
+      if (!opts.brandUrl) throw new Error('brand platform needs opts.brandUrl');
+      return opts.brandUrl;
     default:
       throw new Error(`unknown platform: ${platform}`);
   }
 }
+
+// Platforms whose results we read with the generic retail extractor below.
+const RETAIL_PLATFORMS = ['amazon', 'bestbuy', 'walmart', 'newegg', 'staples', 'canadacomputers', 'ebgames', 'brand'];
 
 async function marketplaceSearch(platform, query, opts = {}) {
   const { page } = await launchBrowser();
@@ -191,7 +207,8 @@ async function marketplaceSearch(platform, query, opts = {}) {
   await page.waitForTimeout(3500);
   try { await page.mouse.wheel(0, 2400); await page.waitForTimeout(1500); } catch (_) {}
 
-  const items = await page.evaluate((platform) => {
+  const isRetail = RETAIL_PLATFORMS.includes(platform);
+  const items = await page.evaluate(({ platform, isRetail }) => {
     const clean = s => (s || '').replace(/\s+/g, ' ').trim();
     const priceFrom = txt => {
       const m = clean(txt).match(/\$[\d,]+(?:\.\d{2})?/);
@@ -199,6 +216,56 @@ async function marketplaceSearch(platform, query, opts = {}) {
     };
     const out = [];
     const seen = new Set();
+
+    // ── Generic retail extractor ──
+    // Retail layouts vary wildly, so read structured data first: most stores
+    // embed schema.org Product/ItemList JSON-LD. Fall back to a DOM heuristic
+    // (a product-link anchor with a nearby price + image).
+    if (isRetail) {
+      const push = (o) => {
+        const id = `${platform}_` + (o.url || o.title).replace(/[^\w]/g, '').slice(-40);
+        if (!o.title || seen.has(id)) return;
+        seen.add(id);
+        out.push({ id, title: o.title, price: o.price ?? null, url: o.url || location.href, image: o.image || null, location: null });
+      };
+      // 1) JSON-LD
+      for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+        let data; try { data = JSON.parse(s.textContent); } catch { continue; }
+        const nodes = Array.isArray(data) ? data : (data['@graph'] || [data]);
+        for (const n of nodes) {
+          const items2 = n && n.itemListElement ? n.itemListElement.map(e => e.item || e) : (n && n['@type'] === 'Product' ? [n] : []);
+          for (const p of items2) {
+            if (!p || !(p.name || p.title)) continue;
+            const offers = Array.isArray(p.offers) ? p.offers[0] : p.offers;
+            push({
+              title: clean(p.name || p.title),
+              price: offers && offers.price ? parseFloat(offers.price) : priceFrom(JSON.stringify(offers || '')),
+              url: typeof p.url === 'string' ? (p.url.startsWith('http') ? p.url : location.origin + p.url) : location.href,
+              image: Array.isArray(p.image) ? p.image[0] : (typeof p.image === 'string' ? p.image : (p.image && p.image.url)),
+            });
+          }
+        }
+      }
+      // 2) DOM heuristic fallback
+      if (out.length < 3) {
+        const anchors = [...document.querySelectorAll('a[href]')].filter(a => {
+          const t = clean(a.innerText);
+          return t.length > 15 && /\$\d/.test(a.closest('li,div,article')?.innerText || '');
+        });
+        for (const a of anchors.slice(0, 60)) {
+          const card = a.closest('li, article, div[data-item], div[class*="product"], div[class*="Product"]') || a;
+          const img = card.querySelector('img');
+          const href = a.getAttribute('href') || '';
+          push({
+            title: clean(a.innerText).split('\n')[0],
+            price: priceFrom(card.innerText),
+            url: href.startsWith('http') ? href : location.origin + href,
+            image: img ? (img.src || img.getAttribute('data-src') || img.getAttribute('srcset')?.split(' ')[0]) : null,
+          });
+        }
+      }
+      return out.slice(0, 40);
+    }
 
     if (platform === 'facebook') {
       for (const a of document.querySelectorAll('a[href*="/marketplace/item/"]')) {
@@ -242,7 +309,7 @@ async function marketplaceSearch(platform, query, opts = {}) {
       }
     }
     return out.slice(0, 40);
-  }, platform);
+  }, { platform, isRetail });
 
   return { platform, url, count: items.length, items };
 }
