@@ -482,6 +482,20 @@ app.post('/claude/work', async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Pre-flight: report whether Claude Code + the work folder are present.
+app.post('/claude/preflight', async (req, res) => {
+  if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });
+  try { res.json(await claudeModule.preflight()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Recent console output of the autopilot work sessions.
+app.post('/claude/console', async (req, res) => {
+  if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });
+  try { res.json(claudeModule.consoleTail((req.body || {}).lines)); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/browser/instagram/login', async (req, res) => {
   if (!browserModule) return res.status(503).json({ error: 'Playwright not installed' });
   const username = process.env.INSTAGRAM_USERNAME;

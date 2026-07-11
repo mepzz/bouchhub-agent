@@ -16,6 +16,9 @@ const os = require('os');
 const path = require('path');
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
+// Autopilot work sessions tee their output here so the hub can show a console.
+const LOG_PATH = path.join(os.tmpdir(), 'bouchhub-autopilot.log');
+const WORK_FOLDER = path.join(os.homedir(), 'Downloads', 'BouchHub2');
 
 function run(cmd, args, { timeoutMs = 60000, cwd } = {}) {
   return new Promise((resolve) => {
@@ -96,17 +99,44 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
   const promptFile = path.join(os.tmpdir(), `bouchhub-handoff-${Date.now()}.txt`);
   fs.writeFileSync(promptFile, prompt, 'utf8');
 
+  // Stamp a session header so the console view shows when each run started.
+  try { fs.appendFileSync(LOG_PATH, `\n===== BouchHub session started (${new Date().toISOString()}) =====\n`); } catch (_) {}
+
   if (process.platform === 'win32') {
-    // Open a new PowerShell window, cd to the repo, pipe the handoff into claude.
-    const psInner = `Set-Location -LiteralPath '${workDir}'; Get-Content -Raw '${promptFile}' | ${CLAUDE_BIN} ${flags.join(' ')}`;
+    // Open a new PowerShell window, cd to the repo, pipe the handoff into claude,
+    // and TEE the output to a log file so the hub can show a live console.
+    const psInner = `Set-Location -LiteralPath '${workDir}'; Get-Content -Raw '${promptFile}' | ${CLAUDE_BIN} ${flags.join(' ')} 2>&1 | Tee-Object -FilePath '${LOG_PATH}' -Append`;
     const child = spawn('powershell.exe', ['-NoExit', '-Command', psInner], { detached: true, stdio: 'ignore', windowsHide: false });
     child.unref();
-    return { launched: true, workDir, promptFile };
+    return { launched: true, workDir, promptFile, logPath: LOG_PATH };
   }
-  // Non-Windows dev fallback: run headless-ish in the background.
-  const child = spawn('sh', ['-c', `cd '${workDir}' && cat '${promptFile}' | ${CLAUDE_BIN} ${flags.join(' ')}`], { detached: true, stdio: 'ignore' });
+  // Non-Windows dev fallback: run headless-ish in the background, tee to the log.
+  const child = spawn('sh', ['-c', `cd '${workDir}' && cat '${promptFile}' | ${CLAUDE_BIN} ${flags.join(' ')} 2>&1 | tee -a '${LOG_PATH}'`], { detached: true, stdio: 'ignore' });
   child.unref();
-  return { launched: true, workDir, promptFile };
+  return { launched: true, workDir, promptFile, logPath: LOG_PATH };
 }
 
-module.exports = { status, work, parseUsage };
+// Pre-flight: is everything needed to run Autopilot actually present on this PC?
+async function preflight() {
+  const fs = require('fs');
+  const workFolderExists = fs.existsSync(WORK_FOLDER);
+  let hasClaude = false, claudeVersion = null;
+  try {
+    const r = await run(CLAUDE_BIN, ['--version'], { timeoutMs: 15000 });
+    const v = `${r.out}`.trim().split('\n')[0];
+    if (r.code === 0 && /\d/.test(v)) { hasClaude = true; claudeVersion = v; }
+  } catch (_) {}
+  return { hasClaude, claudeVersion, workFolder: WORK_FOLDER, workFolderExists, logPath: LOG_PATH };
+}
+
+// Recent console output of the work sessions (tail of the tee'd log).
+function consoleTail(lines = 250) {
+  const fs = require('fs');
+  try {
+    if (!fs.existsSync(LOG_PATH)) return { lines: [], note: 'No session output yet.' };
+    const all = fs.readFileSync(LOG_PATH, 'utf8').split(/\r?\n/);
+    return { lines: all.slice(-Math.max(1, Math.min(lines, 1000))) };
+  } catch (e) { return { lines: [], note: e.message }; }
+}
+
+module.exports = { status, work, parseUsage, preflight, consoleTail, LOG_PATH };
