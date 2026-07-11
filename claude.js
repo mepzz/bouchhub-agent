@@ -32,6 +32,63 @@ function run(cmd, args, { timeoutMs = 60000, cwd } = {}) {
   });
 }
 
+// Quote a path for a shell command when it contains spaces.
+function q(p) { return /\s/.test(p) && !/^".*"$/.test(p) ? `"${p}"` : p; }
+
+// ─── Locate the Claude Code CLI ──────────────────────────────────────────────
+// A background agent doesn't always inherit the interactive shell's PATH, so
+// `claude` alone can fail even when it's installed. Search hard: PATH, then
+// `where`/`which`, then the common install locations, and remember what worked.
+let _claudeBin = null;
+let _claudeSearch = [];
+function claudeCandidates() {
+  const home = os.homedir();
+  const A = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+  const L = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+  const list = [CLAUDE_BIN];
+  if (process.platform === 'win32') {
+    list.push('claude.cmd', 'claude.exe',
+      path.join(A, 'npm', 'claude.cmd'),
+      path.join(A, 'npm', 'claude.ps1'),
+      path.join(L, 'Programs', 'claude', 'claude.exe'),
+      path.join(home, '.local', 'bin', 'claude.exe'),
+      path.join(home, 'AppData', 'Local', 'Microsoft', 'WinGet', 'Links', 'claude.exe'),
+    );
+  } else {
+    list.push('/usr/local/bin/claude', '/opt/homebrew/bin/claude',
+      path.join(home, '.local', 'bin', 'claude'),
+      path.join(home, '.npm-global', 'bin', 'claude'));
+  }
+  return [...new Set(list.filter(Boolean))];
+}
+async function resolveClaude() {
+  if (_claudeBin) return _claudeBin;
+  _claudeSearch = [];
+  const fs = require('fs');
+  // 1) `where claude` (win) / `which claude` — respects the process PATH.
+  try {
+    const r = await run(process.platform === 'win32' ? 'where' : 'which', ['claude'], { timeoutMs: 8000 });
+    const first = `${r.out}`.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0];
+    _claudeSearch.push(`where/which → ${r.code === 0 && first ? first : 'not found'}`);
+    if (r.code === 0 && first) { _claudeBin = q(first); return _claudeBin; }
+  } catch (e) { _claudeSearch.push(`where/which errored: ${e.message}`); }
+  // 2) Known full-path candidates that exist on disk.
+  for (const bin of claudeCandidates()) {
+    if (bin.includes(path.sep) || /[\\/]/.test(bin)) {
+      try { if (fs.existsSync(bin)) { _claudeSearch.push(`found file: ${bin}`); _claudeBin = q(bin); return _claudeBin; } } catch (_) {}
+    }
+  }
+  // 3) Last resort: try `--version` on each bare candidate (PATH-dependent).
+  for (const bin of claudeCandidates()) {
+    try {
+      const r = await run(q(bin), ['--version'], { timeoutMs: 10000 });
+      if (r.code === 0 && /\d/.test(`${r.out}`)) { _claudeSearch.push(`ran: ${bin}`); _claudeBin = q(bin); return _claudeBin; }
+    } catch (_) {}
+  }
+  _claudeSearch.push('exhausted all known locations');
+  return null;
+}
+
 // Parse a usage blob into { usedPct, resetsInMin }. Handles a few phrasings:
 //   "You've used 73% of your current session"
 //   "Session usage: 98% (resets in 2h 15m)"
@@ -67,12 +124,14 @@ function parseUsage(text) {
 }
 
 async function status() {
+  const bin = await resolveClaude();
+  if (!bin) return { usedPct: null, resetsInMin: null, raw: 'Claude Code not found on this PC' };
   // `claude usage` isn't a stable subcommand across versions; try a couple of
   // ways and parse whatever prints. All are read-only.
   const attempts = [
-    [CLAUDE_BIN, ['usage']],
-    [CLAUDE_BIN, ['--print', '/usage']],
-    [CLAUDE_BIN, ['-p', '"/usage"']],
+    [bin, ['usage']],
+    [bin, ['--print', '/usage']],
+    [bin, ['-p', '"/usage"']],
   ];
   for (const [cmd, args] of attempts) {
     const r = await run(cmd, args, { timeoutMs: 30000 });
@@ -102,16 +161,19 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
   // Stamp a session header so the console view shows when each run started.
   try { fs.appendFileSync(LOG_PATH, `\n===== BouchHub session started (${new Date().toISOString()}) =====\n`); } catch (_) {}
 
+  // Not awaited above (work is sync), but resolveClaude caches after preflight;
+  // fall back to the bare command if it hasn't been resolved yet.
+  const bin = _claudeBin || CLAUDE_BIN;
   if (process.platform === 'win32') {
     // Open a new PowerShell window, cd to the repo, pipe the handoff into claude,
     // and TEE the output to a log file so the hub can show a live console.
-    const psInner = `Set-Location -LiteralPath '${workDir}'; Get-Content -Raw '${promptFile}' | ${CLAUDE_BIN} ${flags.join(' ')} 2>&1 | Tee-Object -FilePath '${LOG_PATH}' -Append`;
+    const psInner = `Set-Location -LiteralPath '${workDir}'; Get-Content -Raw '${promptFile}' | ${bin} ${flags.join(' ')} 2>&1 | Tee-Object -FilePath '${LOG_PATH}' -Append`;
     const child = spawn('powershell.exe', ['-NoExit', '-Command', psInner], { detached: true, stdio: 'ignore', windowsHide: false });
     child.unref();
     return { launched: true, workDir, promptFile, logPath: LOG_PATH };
   }
   // Non-Windows dev fallback: run headless-ish in the background, tee to the log.
-  const child = spawn('sh', ['-c', `cd '${workDir}' && cat '${promptFile}' | ${CLAUDE_BIN} ${flags.join(' ')} 2>&1 | tee -a '${LOG_PATH}'`], { detached: true, stdio: 'ignore' });
+  const child = spawn('sh', ['-c', `cd '${workDir}' && cat '${promptFile}' | ${bin} ${flags.join(' ')} 2>&1 | tee -a '${LOG_PATH}'`], { detached: true, stdio: 'ignore' });
   child.unref();
   return { launched: true, workDir, promptFile, logPath: LOG_PATH };
 }
@@ -121,12 +183,19 @@ async function preflight() {
   const fs = require('fs');
   const workFolderExists = fs.existsSync(WORK_FOLDER);
   let hasClaude = false, claudeVersion = null;
-  try {
-    const r = await run(CLAUDE_BIN, ['--version'], { timeoutMs: 15000 });
-    const v = `${r.out}`.trim().split('\n')[0];
-    if (r.code === 0 && /\d/.test(v)) { hasClaude = true; claudeVersion = v; }
-  } catch (_) {}
-  return { hasClaude, claudeVersion, workFolder: WORK_FOLDER, workFolderExists, logPath: LOG_PATH };
+  const bin = await resolveClaude();
+  if (bin) {
+    try {
+      const r = await run(bin, ['--version'], { timeoutMs: 15000 });
+      const v = `${r.out}`.trim().split('\n')[0];
+      if (r.code === 0 && /\d/.test(v)) { hasClaude = true; claudeVersion = v; }
+      else if (/[\\/]/.test(bin.replace(/"/g, ''))) { hasClaude = true; claudeVersion = 'installed (version check quiet)'; }
+    } catch (_) {}
+  }
+  return {
+    hasClaude, claudeVersion, claudeBin: bin || null, claudeSearch: _claudeSearch,
+    workFolder: WORK_FOLDER, workFolderExists, logPath: LOG_PATH,
+  };
 }
 
 // Recent console output of the work sessions (tail of the tee'd log).
