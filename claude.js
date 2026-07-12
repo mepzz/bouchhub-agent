@@ -205,7 +205,22 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
     // NOTE: PowerShell needs the call operator `&` to EXECUTE a command given
     // as a quoted path/variable — without it, a quoted path is just printed and
     // claude never runs.
-    const psInner = `Set-Location -LiteralPath '${workDir}'; Get-Content -Raw '${promptFile}' | & ${bin} ${flags.join(' ')} 2>&1 | Tee-Object -FilePath '${LOG_PATH}' -Append`;
+    //
+    // We log the resolved binary, wrap the run in try/catch, and record the exit
+    // code — so if claude fails to START (bad path, not logged in, crash on
+    // launch) the Bot console shows WHY instead of just the session header. A
+    // launch error is a PowerShell statement error that a bare `2>&1` pipe would
+    // miss, which is exactly the "stops at the header" symptom.
+    const L = LOG_PATH.replace(/'/g, "''");
+    const tee = `Tee-Object -FilePath '${L}' -Append`;
+    const psInner = [
+      `$ErrorActionPreference='Continue'`,
+      `Set-Location -LiteralPath '${workDir.replace(/'/g, "''")}'`,
+      `"[launcher] running: ${bin.replace(/"/g, '')} ${flags.join(' ')}" | ${tee}`,
+      `try { Get-Content -Raw '${promptFile.replace(/'/g, "''")}' | & ${bin} ${flags.join(' ')} 2>&1 | ${tee} }`,
+      `catch { "[launcher] ERROR launching claude: $_" | ${tee} }`,
+      `"[launcher] claude exited with code $LASTEXITCODE at $(Get-Date -Format o)" | ${tee}`,
+    ].join('; ');
     const child = spawn('powershell.exe', ['-NoExit', '-Command', psInner], { detached: true, stdio: 'ignore', windowsHide: false });
     child.unref();
     return { launched: true, workDir, promptFile, logPath: LOG_PATH };
