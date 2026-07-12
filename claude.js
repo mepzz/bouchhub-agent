@@ -211,13 +211,21 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
     // launch) the Bot console shows WHY instead of just the session header. A
     // launch error is a PowerShell statement error that a bare `2>&1` pipe would
     // miss, which is exactly the "stops at the header" symptom.
+    // Pass the handoff as an ARGUMENT, not via stdin. Piping the prompt into
+    // `claude -p` on stdin is unreliable here (claude warns "no stdin data
+    // received in 3s, proceeding without it" and runs with an empty prompt) —
+    // whereas `claude -p "<prompt>"` works. We read the file into a PowerShell
+    // variable (avoids all command-line quoting of a long multi-line prompt,
+    // since $p expands to a single argument) and hand it to claude directly.
     const L = LOG_PATH.replace(/'/g, "''");
     const tee = `Tee-Object -FilePath '${L}' -Append`;
+    const tailFlags = flags.filter(f => f !== '-p').join(' '); // --verbose [--dangerously-skip-permissions]
     const psInner = [
       `$ErrorActionPreference='Continue'`,
       `Set-Location -LiteralPath '${workDir.replace(/'/g, "''")}'`,
-      `"[launcher] running: ${bin.replace(/"/g, '')} ${flags.join(' ')}" | ${tee}`,
-      `try { Get-Content -Raw '${promptFile.replace(/'/g, "''")}' | & ${bin} ${flags.join(' ')} 2>&1 | ${tee} }`,
+      `$p = Get-Content -Raw '${promptFile.replace(/'/g, "''")}'`,
+      `"[launcher] running: ${bin.replace(/"/g, '')} -p <prompt> ${tailFlags}" | ${tee}`,
+      `try { & ${bin} -p $p ${tailFlags} 2>&1 | ${tee} }`,
       `catch { "[launcher] ERROR launching claude: $_" | ${tee} }`,
       `"[launcher] claude exited with code $LASTEXITCODE at $(Get-Date -Format o)" | ${tee}`,
     ].join('; ');
@@ -225,8 +233,10 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
     child.unref();
     return { launched: true, workDir, promptFile, logPath: LOG_PATH };
   }
-  // Non-Windows dev fallback: run headless-ish in the background, tee to the log.
-  const child = spawn('sh', ['-c', `cd '${workDir}' && cat '${promptFile}' | ${bin} ${flags.join(' ')} 2>&1 | tee -a '${LOG_PATH}'`], { detached: true, stdio: 'ignore' });
+  // Non-Windows dev fallback: pass the prompt as an argument too (same reason as
+  // above), reading it from the file so we don't have to quote it on the CLI.
+  const tail = flags.filter(f => f !== '-p').join(' ');
+  const child = spawn('sh', ['-c', `cd '${workDir}' && ${bin} -p "$(cat '${promptFile}')" ${tail} 2>&1 | tee -a '${LOG_PATH}'`], { detached: true, stdio: 'ignore' });
   child.unref();
   return { launched: true, workDir, promptFile, logPath: LOG_PATH };
 }
