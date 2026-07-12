@@ -220,13 +220,17 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
     const L = LOG_PATH.replace(/'/g, "''");
     const tee = `Tee-Object -FilePath '${L}' -Append`;
     const tailFlags = flags.filter(f => f !== '-p').join(' '); // --verbose [--dangerously-skip-permissions]
+    // NOTE: try/catch must be ONE contiguous statement — a ';' between the try
+    // block and 'catch' is a PowerShell parse error, and PowerShell parses the
+    // whole -Command string before running any of it, so a stray ';' there makes
+    // the ENTIRE script fail to parse (nothing runs, only the Node-written header
+    // shows). Keep the try{}catch{} in a single array element.
     const psInner = [
       `$ErrorActionPreference='Continue'`,
       `Set-Location -LiteralPath '${workDir.replace(/'/g, "''")}'`,
       `$p = Get-Content -Raw '${promptFile.replace(/'/g, "''")}'`,
       `"[launcher] running: ${bin.replace(/"/g, '')} -p <prompt> ${tailFlags}" | ${tee}`,
-      `try { & ${bin} -p $p ${tailFlags} 2>&1 | ${tee} }`,
-      `catch { "[launcher] ERROR launching claude: $_" | ${tee} }`,
+      `try { & ${bin} -p $p ${tailFlags} 2>&1 | ${tee} } catch { "[launcher] ERROR launching claude: $_" | ${tee} }`,
       `"[launcher] claude exited with code $LASTEXITCODE at $(Get-Date -Format o)" | ${tee}`,
     ].join('; ');
     const child = spawn('powershell.exe', ['-NoExit', '-Command', psInner], { detached: true, stdio: 'ignore', windowsHide: false });
