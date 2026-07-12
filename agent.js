@@ -465,34 +465,38 @@ app.post('/browser/extract', async (req, res) => {
 let claudeModule;
 try { claudeModule = require('./claude'); } catch (e) { console.warn('[Agent] claude module unavailable:', e.message); }
 
-// Read current Max session usage %, so the hub can gate work on the cutoff.
+// Whether a provider (claude|codex|gemini) may run now. Claude carries the Max
+// usage gate; the others report always-runnable.
 app.post('/claude/status', async (req, res) => {
   if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });
-  try { res.json(await claudeModule.status()); }
+  const provider = (req.body || {}).provider || 'claude';
+  try { res.json(await claudeModule.status(provider)); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Launch a detached Claude Code session with a handoff prompt, auto-accepting
-// permissions, working in the given folder (default Downloads/BouchHub2).
+// Launch an autonomous agent session (provider defaults to claude) with a
+// handoff prompt, auto-accepting permissions, in the given folder.
 app.post('/claude/work', async (req, res) => {
   if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });
-  const { prompt, cwd, autoAccept } = req.body || {};
+  const { prompt, cwd, autoAccept, provider } = req.body || {};
   if (!prompt) return res.status(400).json({ error: 'prompt required' });
-  try { res.json(claudeModule.work({ prompt, cwd, autoAccept: autoAccept !== false })); }
+  try { res.json(claudeModule.work({ provider: provider || 'claude', prompt, cwd, autoAccept: autoAccept !== false })); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Pre-flight: report whether Claude Code + the work folder are present.
+// Pre-flight: report whether a provider's CLI + its work folder are present.
 app.post('/claude/preflight', async (req, res) => {
   if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });
-  try { res.json(await claudeModule.preflight()); }
+  const provider = (req.body || {}).provider || 'claude';
+  try { res.json(await claudeModule.preflight(provider)); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Recent console output of the autopilot work sessions.
+// Recent console output of a provider's work sessions.
 app.post('/claude/console', async (req, res) => {
   if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });
-  try { res.json(claudeModule.consoleTail((req.body || {}).lines)); }
+  const { provider, lines } = req.body || {};
+  try { res.json(claudeModule.consoleTail(provider || 'claude', lines)); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
