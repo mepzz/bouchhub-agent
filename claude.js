@@ -66,11 +66,17 @@ async function resolveClaude() {
   _claudeSearch = [];
   const fs = require('fs');
   // 1) `where claude` (win) / `which claude` — respects the process PATH.
+  //    On Windows `where` can list several matches; prefer the EXECUTABLE shim
+  //    (.cmd/.exe) over the extensionless Node launcher, which can't be run
+  //    directly (that produced "opens a script but doesn't run it").
   try {
     const r = await run(process.platform === 'win32' ? 'where' : 'which', ['claude'], { timeoutMs: 8000 });
-    const first = `${r.out}`.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0];
-    _claudeSearch.push(`where/which → ${r.code === 0 && first ? first : 'not found'}`);
-    if (r.code === 0 && first) { _claudeBin = q(first); return _claudeBin; }
+    const lines = `${r.out}`.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const best = process.platform === 'win32'
+      ? (lines.find(l => /\.cmd$/i.test(l)) || lines.find(l => /\.exe$/i.test(l)) || lines.find(l => /\.bat$/i.test(l)) || lines[0])
+      : lines[0];
+    _claudeSearch.push(`where/which → ${r.code === 0 && best ? best : 'not found'}`);
+    if (r.code === 0 && best) { _claudeBin = q(best); return _claudeBin; }
   } catch (e) { _claudeSearch.push(`where/which errored: ${e.message}`); }
   // 2) Known full-path candidates that exist on disk.
   for (const bin of claudeCandidates()) {
@@ -196,7 +202,10 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
   if (process.platform === 'win32') {
     // Open a new PowerShell window, cd to the repo, feed the handoff into an
     // agentic `claude -p` run, and TEE the output to a log for the console view.
-    const psInner = `Set-Location -LiteralPath '${workDir}'; Get-Content -Raw '${promptFile}' | ${bin} ${flags.join(' ')} 2>&1 | Tee-Object -FilePath '${LOG_PATH}' -Append`;
+    // NOTE: PowerShell needs the call operator `&` to EXECUTE a command given
+    // as a quoted path/variable — without it, a quoted path is just printed and
+    // claude never runs.
+    const psInner = `Set-Location -LiteralPath '${workDir}'; Get-Content -Raw '${promptFile}' | & ${bin} ${flags.join(' ')} 2>&1 | Tee-Object -FilePath '${LOG_PATH}' -Append`;
     const child = spawn('powershell.exe', ['-NoExit', '-Command', psInner], { detached: true, stdio: 'ignore', windowsHide: false });
     child.unref();
     return { launched: true, workDir, promptFile, logPath: LOG_PATH };
