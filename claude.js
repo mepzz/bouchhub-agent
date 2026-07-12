@@ -200,8 +200,10 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
   // fall back to the bare command if it hasn't been resolved yet.
   const bin = _claudeBin || CLAUDE_BIN;
   if (process.platform === 'win32') {
-    // Open a new PowerShell window, cd to the repo, feed the handoff into an
-    // agentic `claude -p` run, and TEE the output to a log for the console view.
+    // Run an agentic `claude -p` and TEE its output to a log the Bot console
+    // reads. We run PowerShell HIDDEN in the background (no window): the agent
+    // may run in a headless/disconnected session where a window can't render,
+    // and the owner monitors via the Bot console anyway.
     // NOTE: PowerShell needs the call operator `&` to EXECUTE a command given
     // as a quoted path/variable — without it, a quoted path is just printed and
     // claude never runs.
@@ -236,13 +238,24 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
     // Node-side breadcrumbs — written directly to the log so they survive even
     // if PowerShell never runs (spawn fails, window blocked, etc.). If the log
     // shows these lines but no '[launcher]' lines, PowerShell isn't executing.
+    // Call PowerShell by its FULL path. A background agent (e.g. spawned by the
+    // Electron app) doesn't always inherit a PATH that includes the PowerShell
+    // folder, so bare 'powershell.exe' can fail ENOENT and die silently — which
+    // is exactly why the log only ever showed the Node-written header. Fall back
+    // to the bare name only if the full path isn't on disk.
+    const winDir = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
+    const psFull = path.join(winDir, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    let psExe = 'powershell.exe';
+    try { if (fs.existsSync(psFull)) psExe = psFull; } catch (_) {}
     try {
       fs.appendFileSync(LOG_PATH,
         `[agent] resolved claude bin: ${bin}\n` +
+        `[agent] powershell: ${psExe}\n` +
         `[agent] work dir: ${workDir}\n` +
         `[agent] spawning powershell to run claude…\n`);
     } catch (_) {}
-    const child = spawn('powershell.exe', ['-NoExit', '-Command', psInner], { detached: true, stdio: 'ignore', windowsHide: false });
+    const child = spawn(psExe, ['-NoProfile', '-NonInteractive', '-Command', psInner],
+      { detached: true, stdio: 'ignore', windowsHide: true });
     child.on('error', (e) => {
       try { fs.appendFileSync(LOG_PATH, `[agent] FAILED to spawn powershell: ${e.message}\n`); } catch (_) {}
     });
