@@ -219,30 +219,24 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
     // whereas `claude -p "<prompt>"` works. We read the file into a PowerShell
     // variable (avoids all command-line quoting of a long multi-line prompt,
     // since $p expands to a single argument) and hand it to claude directly.
-    const L = LOG_PATH.replace(/'/g, "''");
-    const tee = `Tee-Object -FilePath '${L}' -Append`;
     const tailFlags = flags.filter(f => f !== '-p').join(' '); // --verbose [--dangerously-skip-permissions]
-    // NOTE: try/catch must be ONE contiguous statement — a ';' between the try
-    // block and 'catch' is a PowerShell parse error, and PowerShell parses the
-    // whole -Command string before running any of it, so a stray ';' there makes
-    // the ENTIRE script fail to parse (nothing runs, only the Node-written header
-    // shows). Keep the try{}catch{} in a single array element.
+    // Keep the script SIMPLE (no Tee-Object, no try/catch): we redirect the
+    // whole PowerShell process's stdout+stderr into the log from Node (below),
+    // so claude's output AND any PowerShell parse/startup error land in the log.
+    // Earlier, stdio:'ignore' swallowed PowerShell errors — the process started
+    // (pid logged) then exited with nothing written, and we couldn't see why.
+    // Write-Output goes to stdout → the log fd.
     const psInner = [
       `$ErrorActionPreference='Continue'`,
       `Set-Location -LiteralPath '${workDir.replace(/'/g, "''")}'`,
       `$p = Get-Content -Raw '${promptFile.replace(/'/g, "''")}'`,
-      `"[launcher] running: ${bin.replace(/"/g, '')} -p <prompt> ${tailFlags}" | ${tee}`,
-      `try { & ${bin} -p $p ${tailFlags} 2>&1 | ${tee} } catch { "[launcher] ERROR launching claude: $_" | ${tee} }`,
-      `"[launcher] claude exited with code $LASTEXITCODE at $(Get-Date -Format o)" | ${tee}`,
+      `Write-Output "[launcher] running: ${bin.replace(/"/g, '')} -p <prompt> ${tailFlags}"`,
+      `& ${bin} -p $p ${tailFlags} 2>&1`,
+      `Write-Output "[launcher] claude exited with code $LASTEXITCODE"`,
     ].join('; ');
-    // Node-side breadcrumbs — written directly to the log so they survive even
-    // if PowerShell never runs (spawn fails, window blocked, etc.). If the log
-    // shows these lines but no '[launcher]' lines, PowerShell isn't executing.
     // Call PowerShell by its FULL path. A background agent (e.g. spawned by the
     // Electron app) doesn't always inherit a PATH that includes the PowerShell
-    // folder, so bare 'powershell.exe' can fail ENOENT and die silently — which
-    // is exactly why the log only ever showed the Node-written header. Fall back
-    // to the bare name only if the full path isn't on disk.
+    // folder, so bare 'powershell.exe' can fail ENOENT and die silently.
     const winDir = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
     const psFull = path.join(winDir, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     let psExe = 'powershell.exe';
@@ -254,13 +248,21 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
         `[agent] work dir: ${workDir}\n` +
         `[agent] spawning powershell to run claude…\n`);
     } catch (_) {}
+    // Redirect the child's stdout+stderr straight to the log file. This is the
+    // key change: PowerShell's OWN errors (parse errors, etc.) now show up too,
+    // instead of being discarded by stdio:'ignore'.
+    let logFd = null;
+    try { logFd = fs.openSync(LOG_PATH, 'a'); } catch (_) {}
     const child = spawn(psExe, ['-NoProfile', '-NonInteractive', '-Command', psInner],
-      { detached: true, stdio: 'ignore', windowsHide: true });
+      { detached: true, stdio: ['ignore', logFd || 'ignore', logFd || 'ignore'], windowsHide: true });
     child.on('error', (e) => {
       try { fs.appendFileSync(LOG_PATH, `[agent] FAILED to spawn powershell: ${e.message}\n`); } catch (_) {}
     });
     child.on('spawn', () => {
       try { fs.appendFileSync(LOG_PATH, `[agent] powershell started (pid ${child.pid}).\n`); } catch (_) {}
+      // The child has its own duplicated handle now; release ours so repeated
+      // runs don't leak file descriptors.
+      if (logFd != null) { try { fs.closeSync(logFd); } catch (_) {} }
     });
     child.unref();
     return { launched: true, workDir, promptFile, logPath: LOG_PATH };
