@@ -223,15 +223,22 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
     // Keep the script SIMPLE (no Tee-Object, no try/catch): we redirect the
     // whole PowerShell process's stdout+stderr into the log from Node (below),
     // so claude's output AND any PowerShell parse/startup error land in the log.
-    // Earlier, stdio:'ignore' swallowed PowerShell errors — the process started
-    // (pid logged) then exited with nothing written, and we couldn't see why.
     // Write-Output goes to stdout → the log fd.
+    //
+    // TWO subtle bugs, both found with isolated repros on the target machine:
+    //  1) $p = Get-Content -Raw keeps the file's TRAILING NEWLINE. When
+    //     PowerShell hands $p to the claude.cmd shim, that newline terminates
+    //     the command line and everything AFTER the prompt (the flags) is
+    //     dropped — so --dangerously-skip-permissions never applied, claude ran
+    //     in default mode, waited for an Edit approval nobody could give, and
+    //     exited without committing. Fix: .TrimEnd() the prompt, AND put the
+    //     flags BEFORE '-p $p' so nothing important can be truncated.
     const psInner = [
       `$ErrorActionPreference='Continue'`,
       `Set-Location -LiteralPath '${workDir.replace(/'/g, "''")}'`,
-      `$p = Get-Content -Raw '${promptFile.replace(/'/g, "''")}'`,
-      `Write-Output "[launcher] running: ${bin.replace(/"/g, '')} -p <prompt> ${tailFlags}"`,
-      `& ${bin} -p $p ${tailFlags} 2>&1`,
+      `$p = (Get-Content -Raw '${promptFile.replace(/'/g, "''")}').TrimEnd()`,
+      `Write-Output "[launcher] running: ${bin.replace(/"/g, '')} ${tailFlags} -p <prompt>"`,
+      `& ${bin} ${tailFlags} -p $p 2>&1`,
       `Write-Output "[launcher] claude exited with code $LASTEXITCODE"`,
     ].join('; ');
     // Call PowerShell by its FULL path. A background agent (e.g. spawned by the
@@ -248,13 +255,19 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
         `[agent] work dir: ${workDir}\n` +
         `[agent] spawning powershell to run claude…\n`);
     } catch (_) {}
-    // Redirect the child's stdout+stderr straight to the log file. This is the
-    // key change: PowerShell's OWN errors (parse errors, etc.) now show up too,
-    // instead of being discarded by stdio:'ignore'.
+    // Redirect the child's stdout+stderr straight to the log file so claude's
+    // output AND any PowerShell error land there.
+    //
+    //  2) DO NOT use detached:true here. On the target machine, a PowerShell
+    //     spawned from Node with detached:true starts, exits 0, and executes
+    //     NOTHING — not even a single Set-Content — which was the entire
+    //     "log stops at the header" symptom (cmd.exe works detached; PowerShell
+    //     does not). windowsHide:true alone runs it hidden, and the fd redirect
+    //     captures everything. unref() still lets the agent not wait on it.
     let logFd = null;
     try { logFd = fs.openSync(LOG_PATH, 'a'); } catch (_) {}
     const child = spawn(psExe, ['-NoProfile', '-NonInteractive', '-Command', psInner],
-      { detached: true, stdio: ['ignore', logFd || 'ignore', logFd || 'ignore'], windowsHide: true });
+      { stdio: ['ignore', logFd || 'ignore', logFd || 'ignore'], windowsHide: true });
     child.on('error', (e) => {
       try { fs.appendFileSync(LOG_PATH, `[agent] FAILED to spawn powershell: ${e.message}\n`); } catch (_) {}
     });
@@ -270,7 +283,7 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
   // Non-Windows dev fallback: pass the prompt as an argument too (same reason as
   // above), reading it from the file so we don't have to quote it on the CLI.
   const tail = flags.filter(f => f !== '-p').join(' ');
-  const child = spawn('sh', ['-c', `cd '${workDir}' && ${bin} -p "$(cat '${promptFile}')" ${tail} 2>&1 | tee -a '${LOG_PATH}'`], { detached: true, stdio: 'ignore' });
+  const child = spawn('sh', ['-c', `cd '${workDir}' && ${bin} ${tail} -p "$(cat '${promptFile}')" 2>&1 | tee -a '${LOG_PATH}'`], { detached: true, stdio: 'ignore' });
   child.unref();
   return { launched: true, workDir, promptFile, logPath: LOG_PATH };
 }
