@@ -20,6 +20,20 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const LOG_PATH = path.join(os.tmpdir(), 'bouchhub-autopilot.log');
 const WORK_FOLDER = path.join(os.homedir(), 'Downloads', 'BouchHub2');
 
+// Single-session lock: at most ONE Claude work session at a time. They all share
+// the one git tree in the work folder, so two running at once fight over each
+// other's uncommitted edits. Tracks the live launcher child so work() can refuse
+// a second launch while one is active.
+let _currentWork = null; // { child, startedAt, pid }
+function workBusy() {
+  const w = _currentWork;
+  if (!w || !w.child) return null;
+  if (w.child.exitCode !== null || w.child.killed) return null;
+  const ageMin = Math.round((Date.now() - w.startedAt) / 60000);
+  if (ageMin >= 180) return null; // treat a >3h session as stale/hung — allow a fresh one
+  return { pid: w.pid, ageMin };
+}
+
 function run(cmd, args, { timeoutMs = 60000, cwd } = {}) {
   return new Promise((resolve) => {
     let out = '', err = '';
@@ -177,6 +191,13 @@ async function status() {
 // running after this request returns. Auto-accepts permissions when asked.
 function work({ prompt, cwd, autoAccept = true } = {}) {
   if (!prompt) throw new Error('work needs a prompt');
+
+  // Single-session lock — don't start a second session in the shared work folder.
+  const busy = workBusy();
+  if (busy) {
+    try { require('fs').appendFileSync(LOG_PATH, `\n[agent] a work session is already running (pid ${busy.pid}, ${busy.ageMin}m in) — skipping this launch to avoid two sessions in one git tree.\n`); } catch (_) {}
+    return { launched: false, busy: true, pid: busy.pid, ageMin: busy.ageMin };
+  }
   const workDir = cwd
     ? (path.isAbsolute(cwd) ? cwd : path.join(os.homedir(), cwd))
     : path.join(os.homedir(), 'Downloads', 'BouchHub2');
@@ -277,6 +298,8 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
       // runs don't leak file descriptors.
       if (logFd != null) { try { fs.closeSync(logFd); } catch (_) {} }
     });
+    _currentWork = { child, startedAt: Date.now(), pid: child.pid };
+    child.on('exit', () => { if (_currentWork && _currentWork.child === child) _currentWork = null; });
     child.unref();
     return { launched: true, workDir, promptFile, logPath: LOG_PATH };
   }
@@ -284,6 +307,8 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
   // above), reading it from the file so we don't have to quote it on the CLI.
   const tail = flags.filter(f => f !== '-p').join(' ');
   const child = spawn('sh', ['-c', `cd '${workDir}' && ${bin} ${tail} -p "$(cat '${promptFile}')" 2>&1 | tee -a '${LOG_PATH}'`], { detached: true, stdio: 'ignore' });
+  _currentWork = { child, startedAt: Date.now(), pid: child.pid };
+  child.on('exit', () => { if (_currentWork && _currentWork.child === child) _currentWork = null; });
   child.unref();
   return { launched: true, workDir, promptFile, logPath: LOG_PATH };
 }
