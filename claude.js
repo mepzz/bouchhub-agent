@@ -233,7 +233,22 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
       `try { & ${bin} -p $p ${tailFlags} 2>&1 | ${tee} } catch { "[launcher] ERROR launching claude: $_" | ${tee} }`,
       `"[launcher] claude exited with code $LASTEXITCODE at $(Get-Date -Format o)" | ${tee}`,
     ].join('; ');
+    // Node-side breadcrumbs — written directly to the log so they survive even
+    // if PowerShell never runs (spawn fails, window blocked, etc.). If the log
+    // shows these lines but no '[launcher]' lines, PowerShell isn't executing.
+    try {
+      fs.appendFileSync(LOG_PATH,
+        `[agent] resolved claude bin: ${bin}\n` +
+        `[agent] work dir: ${workDir}\n` +
+        `[agent] spawning powershell to run claude…\n`);
+    } catch (_) {}
     const child = spawn('powershell.exe', ['-NoExit', '-Command', psInner], { detached: true, stdio: 'ignore', windowsHide: false });
+    child.on('error', (e) => {
+      try { fs.appendFileSync(LOG_PATH, `[agent] FAILED to spawn powershell: ${e.message}\n`); } catch (_) {}
+    });
+    child.on('spawn', () => {
+      try { fs.appendFileSync(LOG_PATH, `[agent] powershell started (pid ${child.pid}).\n`); } catch (_) {}
+    });
     child.unref();
     return { launched: true, workDir, promptFile, logPath: LOG_PATH };
   }
