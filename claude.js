@@ -175,11 +175,14 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
     ? (path.isAbsolute(cwd) ? cwd : path.join(os.homedir(), cwd))
     : path.join(os.homedir(), 'Downloads', 'BouchHub2');
 
-  const flags = [];
+  // Run as a full autonomous task: `-p` (print mode) runs the complete agentic
+  // loop — reads the handoff, edits, runs tools, commits, pushes — then exits,
+  // instead of dropping into an interactive session that does one turn. Verbose
+  // so the tee'd console shows what it's doing.
+  const flags = ['-p', '--verbose'];
   if (autoAccept) flags.push('--dangerously-skip-permissions');
 
-  // Pass the prompt via a temp file to avoid quoting nightmares, then open a
-  // visible terminal running claude with that prompt.
+  // Pass the prompt via a temp file to avoid quoting nightmares.
   const fs = require('fs');
   const promptFile = path.join(os.tmpdir(), `bouchhub-handoff-${Date.now()}.txt`);
   fs.writeFileSync(promptFile, prompt, 'utf8');
@@ -191,8 +194,8 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
   // fall back to the bare command if it hasn't been resolved yet.
   const bin = _claudeBin || CLAUDE_BIN;
   if (process.platform === 'win32') {
-    // Open a new PowerShell window, cd to the repo, pipe the handoff into claude,
-    // and TEE the output to a log file so the hub can show a live console.
+    // Open a new PowerShell window, cd to the repo, feed the handoff into an
+    // agentic `claude -p` run, and TEE the output to a log for the console view.
     const psInner = `Set-Location -LiteralPath '${workDir}'; Get-Content -Raw '${promptFile}' | ${bin} ${flags.join(' ')} 2>&1 | Tee-Object -FilePath '${LOG_PATH}' -Append`;
     const child = spawn('powershell.exe', ['-NoExit', '-Command', psInner], { detached: true, stdio: 'ignore', windowsHide: false });
     child.unref();
@@ -208,6 +211,8 @@ function work({ prompt, cwd, autoAccept = true } = {}) {
 async function preflight() {
   const fs = require('fs');
   const workFolderExists = fs.existsSync(WORK_FOLDER);
+  // A pushable clone needs a .git dir — an empty/regular folder can't commit.
+  const workFolderIsRepo = workFolderExists && fs.existsSync(path.join(WORK_FOLDER, '.git'));
   let hasClaude = false, claudeVersion = null;
   const bin = await resolveClaude();
   if (bin) {
@@ -220,7 +225,7 @@ async function preflight() {
   }
   return {
     hasClaude, claudeVersion, claudeBin: bin || null, claudeSearch: _claudeSearch,
-    workFolder: WORK_FOLDER, workFolderExists, logPath: LOG_PATH,
+    workFolder: WORK_FOLDER, workFolderExists, workFolderIsRepo, logPath: LOG_PATH,
   };
 }
 
