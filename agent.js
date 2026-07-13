@@ -841,6 +841,23 @@ function restartSelf() {
   setTimeout(() => process.exit(0), 600);
 }
 
+// Nudge the hub to check for its own updates ("the bot updates the hub"). The
+// hub does the guarded work — pull, run tests, deploy or roll back — this just
+// keeps it current. Harmless if the hub is mid-restart (call just fails).
+async function pokeHubUpdate() {
+  try {
+    const res = await fetch(`${HUB_URL}/api/hub/update`, {
+      method: 'POST',
+      headers: { 'x-agent-secret': AGENT_SECRET, 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data && data.status && data.status !== 'up_to_date' && data.status !== 'disabled') {
+      ulog(`Hub auto-deploy: ${data.status}${data.target ? ' → ' + String(data.target).slice(0, 7) : ''}`);
+    }
+  } catch (_) { /* hub not reachable / mid-restart — ignore */ }
+}
+
 async function checkForUpdates(force = false) {
   if (updateInProgress) return { status: 'already_updating' };
   try {
@@ -927,9 +944,10 @@ async function start() {
   heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
   statsTimer = setInterval(collectStats, STATS_INTERVAL);
 
+  const bothUpdateChecks = () => { checkForUpdates(); pokeHubUpdate(); };
   setTimeout(() => {
-    checkForUpdates();
-    updateTimer = setInterval(checkForUpdates, UPDATE_CHECK_INTERVAL);
+    bothUpdateChecks();
+    updateTimer = setInterval(bothUpdateChecks, UPDATE_CHECK_INTERVAL);
   }, 60 * 1000);
 
   console.log('[Agent] Running. Press Ctrl+C to stop.');
