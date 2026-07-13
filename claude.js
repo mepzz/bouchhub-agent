@@ -38,11 +38,35 @@ const PROVIDERS = {
     subcmd: '', promptFlag: '-p', promptVia: 'arg', usageGate: false,
     flags: (auto) => (auto ? '--yolo' : ''),
   },
+  // A second Claude ORG under the same login. The CLI has no org flag, so we pin
+  // this provider to the other org by running the same `claude` binary with
+  // CLAUDE_CONFIG_DIR pointed at a config dir that's logged into that org (set
+  // CLAUDE2_CONFIG_DIR in the agent .env). Own work folder + own usage gate, so
+  // the two orgs build different items in parallel and each has its own limit.
+  claude2: {
+    cli: 'claude', binEnv: 'CLAUDE2_BIN', defaultFolder: 'BouchHub-Claude2',
+    subcmd: '', promptFlag: '-p', promptVia: 'arg', usageGate: true,
+    flags: (auto) => `--verbose${auto ? ' --dangerously-skip-permissions' : ''}`,
+  },
 };
 function providerOf(name) { return PROVIDERS[name] || PROVIDERS.claude; }
 function providerFlags(name, auto) {
-  const env = process.env[`${name.toUpperCase()}_FLAGS`];
+  const env = process.env[`${envKey(name)}_FLAGS`];
   return env != null ? env : providerOf(name).flags(auto);
+}
+// Env-var-safe upper-case key for a provider name (hyphens → underscores).
+function envKey(name) { return String(name).toUpperCase().replace(/[^A-Z0-9]/g, '_'); }
+
+// A Claude account can belong to several orgs and the CLI exposes no org flag —
+// the active org lives in the config dir's .credentials.json. So we pin a
+// provider to an org via CLAUDE_CONFIG_DIR: point <PROVIDER>_CONFIG_DIR at a dir
+// logged into that org. `claude` also honours the standard CLAUDE_CONFIG_DIR.
+// Separate dirs are REQUIRED for concurrent Claude sessions (a shared ~/.claude
+// corrupts .claude.json / races credentials on Windows).
+function configDirFor(name) { return process.env[`${envKey(name)}_CONFIG_DIR`] || ''; }
+function providerEnv(name) {
+  const dir = configDirFor(name);
+  return dir ? { CLAUDE_CONFIG_DIR: dir } : {};
 }
 
 // Per-provider log so parallel sessions don't interleave. Claude keeps the
@@ -70,10 +94,10 @@ function workBusy(name) {
   return { pid: w.pid, ageMin };
 }
 
-function run(cmd, args, { timeoutMs = 60000, cwd } = {}) {
+function run(cmd, args, { timeoutMs = 60000, cwd, env } = {}) {
   return new Promise((resolve) => {
     let out = '', err = '';
-    const child = spawn(cmd, args, { cwd, shell: true, windowsHide: true });
+    const child = spawn(cmd, args, { cwd, shell: true, windowsHide: true, env: env ? { ...process.env, ...env } : process.env });
     const killer = setTimeout(() => { try { child.kill(); } catch (_) {} }, timeoutMs);
     child.stdout.on('data', d => { out += d; });
     child.stderr.on('data', d => { err += d; });
@@ -194,7 +218,7 @@ async function status(provider = 'claude') {
   // ONE fast rate-limit probe. We used to also try `claude -p /usage` twice for a
   // session %, but the CLI never exposes it to scripts, so those two calls just
   // added ~60s per cycle and made the dashboard sit on "checking usage". Gone.
-  const probe = await run(bin, ['-p', 'ok', '--output-format', 'json'], { timeoutMs: 40000 });
+  const probe = await run(bin, ['-p', 'ok', '--output-format', 'json'], { timeoutMs: 40000, env: providerEnv(provider) });
   const text = `${probe.out}\n${probe.err}`;
   let apiError = null;
   try { const j = JSON.parse(probe.out); apiError = j.api_error_status; } catch (_) {}
@@ -229,6 +253,9 @@ function work({ provider = 'claude', prompt, cwd, autoAccept = true } = {}) {
   try { fs.appendFileSync(LOG, `\n===== BouchHub ${provider} session started (${new Date().toISOString()}) =====\n`); } catch (_) {}
 
   const bin = _bins[provider] || process.env[p.binEnv] || p.cli;
+  // Pin this session to its org's config dir (multi-org Claude). No-op when unset.
+  const cfgDir = configDirFor(provider);
+  const cfgLine = cfgDir ? `$env:CLAUDE_CONFIG_DIR='${cfgDir.replace(/'/g, "''")}'` : null;
 
   if (process.platform === 'win32') {
     const pf = promptFile.replace(/'/g, "''");
@@ -240,11 +267,12 @@ function work({ provider = 'claude', prompt, cwd, autoAccept = true } = {}) {
       const display = ['(stdin) &', bin.replace(/"/g, ''), p.subcmd, flags].filter(Boolean).join(' ');
       psInner = [
         `$ErrorActionPreference='Continue'`,
+        cfgLine,
         `Set-Location -LiteralPath '${workDir.replace(/'/g, "''")}'`,
         `Write-Output "[launcher] running: ${display}"`,
         pipeExpr,
         `Write-Output "[launcher] ${provider} exited with code $LASTEXITCODE"`,
-      ].join('; ');
+      ].filter(Boolean).join('; ');
     } else {
       // Prompt held in $p as a single argument (claude/gemini). .TrimEnd() so a
       // trailing newline can't truncate the command line and drop flags.
@@ -252,12 +280,13 @@ function work({ provider = 'claude', prompt, cwd, autoAccept = true } = {}) {
       const display = ['&', bin.replace(/"/g, ''), p.subcmd, flags, p.promptFlag, '<prompt>'].filter(Boolean).join(' ');
       psInner = [
         `$ErrorActionPreference='Continue'`,
+        cfgLine,
         `Set-Location -LiteralPath '${workDir.replace(/'/g, "''")}'`,
         `$p = (Get-Content -Raw '${pf}').TrimEnd()`,
         `Write-Output "[launcher] running: ${display}"`,
         `${runExpr} 2>&1`,
         `Write-Output "[launcher] ${provider} exited with code $LASTEXITCODE"`,
-      ].join('; ');
+      ].filter(Boolean).join('; ');
     }
     // Full path to PowerShell (a background agent's PATH may not include it), and
     // NEVER detached (a detached PowerShell here starts, exits 0, runs nothing).
@@ -292,7 +321,8 @@ function work({ provider = 'claude', prompt, cwd, autoAccept = true } = {}) {
   const shRun = p.promptVia === 'stdin'
     ? `cat '${promptFile}' | ${[bin, p.subcmd, flags].filter(Boolean).join(' ')}`
     : [bin, p.subcmd, flags, p.promptFlag, `"$(cat '${promptFile}')"`].filter(Boolean).join(' ');
-  const child = spawn('sh', ['-c', `cd '${workDir}' && ${shRun} 2>&1 | tee -a '${LOG}'`], { detached: true, stdio: 'ignore' });
+  const child = spawn('sh', ['-c', `cd '${workDir}' && ${shRun} 2>&1 | tee -a '${LOG}'`],
+    { detached: true, stdio: 'ignore', env: { ...process.env, ...providerEnv(provider) } });
   _locks[provider] = { child, startedAt: Date.now(), pid: child.pid };
   child.on('exit', () => { if (_locks[provider] && _locks[provider].child === child) _locks[provider] = null; });
   child.unref();
