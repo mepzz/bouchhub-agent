@@ -179,10 +179,17 @@ function parseLimit(text) {
 // Whether a provider may run right now. Only Claude has a usage gate; Codex and
 // Gemini have no scriptable usage, so they report always-runnable.
 async function status(provider = 'claude') {
+  // Cheap first: if a work session is already running for this provider, say so
+  // and DON'T spend a real API call probing usage — the dispatcher only needs to
+  // know it's busy. This lets the hub poll often (to refresh live status) without
+  // burning Max quota while a session is in flight.
+  const busyNow = workBusy(provider);
+  if (busyNow) return { provider, busy: true, pid: busyNow.pid, ageMin: busyNow.ageMin, usedPct: null, resetsInMin: null, limited: false, readable: false, raw: `${provider} session running (${busyNow.ageMin}m)` };
+
   const bin = await resolveBin(provider);
-  if (!bin) return { provider, usedPct: null, resetsInMin: null, limited: false, readable: false, raw: `${provider} CLI not found on this PC` };
+  if (!bin) return { provider, busy: false, usedPct: null, resetsInMin: null, limited: false, readable: false, raw: `${provider} CLI not found on this PC` };
   if (!providerOf(provider).usageGate) {
-    return { provider, usedPct: null, resetsInMin: null, limited: false, readable: false, raw: `${provider}: no usage gate` };
+    return { provider, busy: false, usedPct: null, resetsInMin: null, limited: false, readable: false, raw: `${provider}: no usage gate` };
   }
   // ONE fast rate-limit probe. We used to also try `claude -p /usage` twice for a
   // session %, but the CLI never exposes it to scripts, so those two calls just
@@ -193,7 +200,7 @@ async function status(provider = 'claude') {
   try { const j = JSON.parse(probe.out); apiError = j.api_error_status; } catch (_) {}
   const lim = parseLimit(text);
   const limited = lim.limited || apiError === 429 || /429/.test(String(apiError || ''));
-  return { provider, usedPct: null, readable: false, limited, resetsInMin: lim.resetsInMin, raw: (limited ? text : 'not rate-limited').slice(0, 300) };
+  return { provider, busy: false, usedPct: null, readable: false, limited, resetsInMin: lim.resetsInMin, raw: (limited ? text : 'not rate-limited').slice(0, 300) };
 }
 
 // Launch an autonomous session for `provider`, hidden in the background, teeing
