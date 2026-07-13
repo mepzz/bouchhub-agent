@@ -23,17 +23,19 @@ const path = require('path');
 const PROVIDERS = {
   claude: {
     cli: 'claude', binEnv: 'CLAUDE_BIN', defaultFolder: 'BouchHub2',
-    subcmd: '', promptFlag: '-p', usageGate: true,
+    subcmd: '', promptFlag: '-p', promptVia: 'arg', usageGate: true,
     flags: (auto) => `--verbose${auto ? ' --dangerously-skip-permissions' : ''}`,
   },
   codex: {
+    // `codex exec` reads the prompt from STDIN — passing a long multi-line prompt
+    // as a command-line arg gets truncated at the first blank line by cmd.exe.
     cli: 'codex', binEnv: 'CODEX_BIN', defaultFolder: 'BouchHub-Codex',
-    subcmd: 'exec', promptFlag: '', usageGate: false, // prompt is positional after `exec`
+    subcmd: 'exec', promptFlag: '', promptVia: 'stdin', usageGate: false,
     flags: (auto) => (auto ? '--dangerously-bypass-approvals-and-sandbox' : ''),
   },
   gemini: {
     cli: 'gemini', binEnv: 'GEMINI_BIN', defaultFolder: 'BouchHub-Gemini',
-    subcmd: '', promptFlag: '-p', usageGate: false,
+    subcmd: '', promptFlag: '-p', promptVia: 'arg', usageGate: false,
     flags: (auto) => (auto ? '--yolo' : ''),
   },
 };
@@ -227,20 +229,34 @@ function work({ provider = 'claude', prompt, cwd, autoAccept = true } = {}) {
   const bin = _bins[provider] || process.env[p.binEnv] || p.cli;
 
   if (process.platform === 'win32') {
-    // Build the CLI invocation with the prompt held in $p (a single argument —
-    // avoids all quoting of a long multi-line prompt). Order: bin, subcmd, flags,
-    // then the prompt LAST. .TrimEnd() the prompt so a trailing newline can't
-    // truncate the command line and drop flags.
-    const runExpr = ['&', bin, p.subcmd, flags, p.promptFlag, '$p'].filter(Boolean).join(' ');
-    const display = ['&', bin.replace(/"/g, ''), p.subcmd, flags, p.promptFlag, '<prompt>'].filter(Boolean).join(' ');
-    const psInner = [
-      `$ErrorActionPreference='Continue'`,
-      `Set-Location -LiteralPath '${workDir.replace(/'/g, "''")}'`,
-      `$p = (Get-Content -Raw '${promptFile.replace(/'/g, "''")}').TrimEnd()`,
-      `Write-Output "[launcher] running: ${display}"`,
-      `${runExpr} 2>&1`,
-      `Write-Output "[launcher] ${provider} exited with code $LASTEXITCODE"`,
-    ].join('; ');
+    const pf = promptFile.replace(/'/g, "''");
+    let psInner;
+    if (p.promptVia === 'stdin') {
+      // Pipe the full prompt into the CLI's stdin (codex exec). Avoids cmd.exe
+      // truncating a long multi-line prompt passed as an argument.
+      const pipeExpr = ['Get-Content', '-Raw', `'${pf}'`, '|', '&', bin, p.subcmd, flags, '2>&1'].filter(Boolean).join(' ');
+      const display = ['(stdin) &', bin.replace(/"/g, ''), p.subcmd, flags].filter(Boolean).join(' ');
+      psInner = [
+        `$ErrorActionPreference='Continue'`,
+        `Set-Location -LiteralPath '${workDir.replace(/'/g, "''")}'`,
+        `Write-Output "[launcher] running: ${display}"`,
+        pipeExpr,
+        `Write-Output "[launcher] ${provider} exited with code $LASTEXITCODE"`,
+      ].join('; ');
+    } else {
+      // Prompt held in $p as a single argument (claude/gemini). .TrimEnd() so a
+      // trailing newline can't truncate the command line and drop flags.
+      const runExpr = ['&', bin, p.subcmd, flags, p.promptFlag, '$p'].filter(Boolean).join(' ');
+      const display = ['&', bin.replace(/"/g, ''), p.subcmd, flags, p.promptFlag, '<prompt>'].filter(Boolean).join(' ');
+      psInner = [
+        `$ErrorActionPreference='Continue'`,
+        `Set-Location -LiteralPath '${workDir.replace(/'/g, "''")}'`,
+        `$p = (Get-Content -Raw '${pf}').TrimEnd()`,
+        `Write-Output "[launcher] running: ${display}"`,
+        `${runExpr} 2>&1`,
+        `Write-Output "[launcher] ${provider} exited with code $LASTEXITCODE"`,
+      ].join('; ');
+    }
     // Full path to PowerShell (a background agent's PATH may not include it), and
     // NEVER detached (a detached PowerShell here starts, exits 0, runs nothing).
     const winDir = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
@@ -271,7 +287,9 @@ function work({ provider = 'claude', prompt, cwd, autoAccept = true } = {}) {
   }
 
   // Non-Windows dev fallback.
-  const shRun = [bin, p.subcmd, flags, p.promptFlag, `"$(cat '${promptFile}')"`].filter(Boolean).join(' ');
+  const shRun = p.promptVia === 'stdin'
+    ? `cat '${promptFile}' | ${[bin, p.subcmd, flags].filter(Boolean).join(' ')}`
+    : [bin, p.subcmd, flags, p.promptFlag, `"$(cat '${promptFile}')"`].filter(Boolean).join(' ');
   const child = spawn('sh', ['-c', `cd '${workDir}' && ${shRun} 2>&1 | tee -a '${LOG}'`], { detached: true, stdio: 'ignore' });
   _locks[provider] = { child, startedAt: Date.now(), pid: child.pid };
   child.on('exit', () => { if (_locks[provider] && _locks[provider].child === child) _locks[provider] = null; });
