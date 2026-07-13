@@ -909,6 +909,10 @@ async function start() {
   console.log(`║  Port:   ${String(PORT).padEnd(26)}║`);
   console.log('╚════════════════════════════════════╝\n');
 
+  // Startup breadcrumb in the update log — after an auto-update+restart this new
+  // marker appearing proves the fresh code is actually running.
+  ulog(`Agent v${AGENT_VERSION} started — build marker: auto-update-test-1`);
+
   console.log('[Agent] Collecting initial stats...');
   try {
     await Promise.race([
