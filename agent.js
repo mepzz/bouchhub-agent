@@ -21,8 +21,22 @@ const PORT = parseInt(AGENT_PORT || '3001');
 const HEARTBEAT_INTERVAL = 5 * 1000;
 const STATS_INTERVAL = 5 * 1000;
 const UPDATE_CHECK_INTERVAL = 5 * 60 * 1000;
-// When running under Electron, use the bundled git and repo dir
-const ROOT = process.env.BOUCHHUB_REPO_DIR || path.join(__dirname, '..');
+// Where the git repo actually lives. agent.js sits AT the repo root, so `.git`
+// is in __dirname — the old default of __dirname/.. pointed one level too high,
+// so every `git fetch` ran in a non-repo folder and the auto-updater silently
+// did nothing. Find the real repo by walking up looking for `.git`.
+function findRepoRoot(start) {
+  const fs = require('fs');
+  let dir = start;
+  for (let i = 0; i < 5; i++) {
+    try { if (fs.existsSync(path.join(dir, '.git'))) return dir; } catch (_) {}
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return start;
+}
+const ROOT = process.env.BOUCHHUB_REPO_DIR || findRepoRoot(__dirname);
 const GIT_EXE = process.env.BOUCHHUB_GIT_EXE || 'git';
 const git = simpleGit(ROOT, {
   binary: GIT_EXE,
@@ -720,7 +734,23 @@ app.post('/screen/input', async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`[Agent] API listening on port ${PORT}`));
+// Retry the bind on EADDRINUSE — during a self-update restart the old process
+// may not have released the port yet. Without this, the fresh agent would crash
+// on launch and the update would leave nothing running.
+function listenWithRetry(port, host, attempt = 0) {
+  const server = app.listen(port, host, () => console.log(`[Agent] API listening on port ${port}`));
+  server.once('error', (err) => {
+    if (err.code === 'EADDRINUSE' && attempt < 20) {
+      if (attempt === 0) console.warn(`[Agent] Port ${port} busy (restart in progress?) — retrying…`);
+      try { server.close(); } catch (_) {}
+      setTimeout(() => listenWithRetry(port, host, attempt + 1), 1000);
+    } else {
+      console.error(`[Agent] Failed to bind port ${port}: ${err.message}`);
+      process.exit(1);
+    }
+  });
+}
+listenWithRetry(PORT, '0.0.0.0');
 
 // ─── Heartbeat ─────────────────────────────────────────────
 function getLocalIp() {
@@ -780,6 +810,37 @@ async function notifyOffline() {
 // ─── Auto-updater ──────────────────────────────────────────
 let updateInProgress = false;
 
+// Log update activity to a file too — the agent's console output is usually
+// swallowed by the app wrapper, so this is how you SEE whether it's pulling.
+const UPDATE_LOG = path.join(os.tmpdir(), 'bouchhub-agent-update.log');
+function ulog(msg) {
+  const line = `[${new Date().toISOString()}] ${msg}`;
+  console.log('[Agent] ' + msg);
+  try { require('fs').appendFileSync(UPDATE_LOG, line + '\n'); } catch (_) {}
+}
+
+function restartSelf() {
+  const { spawn } = require('child_process');
+  if (UNDER_TRAY) {
+    ulog('Restarting via tray (exit 42).');
+    setTimeout(() => process.exit(42), 400);
+    return;
+  }
+  // Standalone/packaged: relaunch ourselves detached, then exit. The new process
+  // may hit the port before we fully release it — the listen retry handles that.
+  // ELECTRON_RUN_AS_NODE makes an Electron execPath run the script as plain Node.
+  const entry = path.join(ROOT, 'agent.js');
+  const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1' };
+  try {
+    const child = spawn(process.execPath, [entry], { detached: true, stdio: 'ignore', env, windowsHide: true });
+    child.unref();
+    ulog(`Relaunched self (pid ${child.pid}) → ${entry}. Exiting old process.`);
+  } catch (e) {
+    ulog(`Self-relaunch failed: ${e.message}. Exiting anyway (supervisor/app should respawn).`);
+  }
+  setTimeout(() => process.exit(0), 600);
+}
+
 async function checkForUpdates(force = false) {
   if (updateInProgress) return { status: 'already_updating' };
   try {
@@ -789,40 +850,30 @@ async function checkForUpdates(force = false) {
       if (gitStatus.behind === 0 && force) {
         return { status: 'up_to_date' };
       }
-      console.log(`[Agent] Update available (${gitStatus.behind} commit(s) behind). Pulling...`);
+      ulog(`Update available (${gitStatus.behind} commit(s) behind) in ${ROOT}. Pulling…`);
       updateInProgress = true;
       // Hard reset to avoid local change conflicts — agent files should never be manually edited
       await git.fetch('origin', 'main');
       await git.reset(['--hard', 'origin/main']);
-      console.log('[Agent] Pull complete. Reinstalling dependencies...');
-      await new Promise((resolve, reject) => {
-        exec('npm install --prefix ' + JSON.stringify(__dirname), { cwd: __dirname, windowsHide: true }, (err) => {
-          if (err) reject(err);
-          else resolve();
+      // Reinstall deps, but NEVER let a dep-install hiccup block the restart —
+      // the code update is what matters; deps rarely change for the agent.
+      await new Promise((resolve) => {
+        exec('npm install --prefix ' + JSON.stringify(ROOT), { cwd: ROOT, windowsHide: true, timeout: 180000 }, (err) => {
+          if (err) ulog(`npm install warning (continuing to restart): ${err.message}`);
+          resolve();
         });
       });
-      console.log('[Agent] Update applied.');
-      if (UNDER_TRAY) {
-        // Signal tray wrapper to restart us cleanly
-        console.log('[Agent] Signalling tray for restart (exit 42)...');
-        setTimeout(() => process.exit(42), 500);
-      } else {
-        // Standalone fallback: spawn new instance and exit
-        const { spawn } = require('child_process');
-        const child = spawn(process.execPath, [path.join(__dirname, 'agent.js')], {
-          detached: true, stdio: 'ignore', env: process.env, windowsHide: true
-        });
-        child.unref();
-        setTimeout(() => process.exit(0), 500);
-      }
+      ulog('Update applied. Restarting…');
+      restartSelf();
       return { status: 'updated' };
     } else {
-      console.log('[Agent] Already up to date.');
+      // Quiet on the console, but leave a breadcrumb so the log shows it's alive.
+      try { require('fs').appendFileSync(UPDATE_LOG, `[${new Date().toISOString()}] up to date\n`); } catch (_) {}
       return { status: 'up_to_date' };
     }
   } catch (err) {
     updateInProgress = false;
-    console.warn('[Agent] Update check failed:', err.message);
+    ulog(`Update check FAILED: ${err.message}  (git ROOT=${ROOT})`);
     return { status: 'error', error: err.message };
   }
 }
