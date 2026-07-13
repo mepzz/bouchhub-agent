@@ -184,15 +184,10 @@ async function status(provider = 'claude') {
   if (!providerOf(provider).usageGate) {
     return { provider, usedPct: null, resetsInMin: null, limited: false, readable: false, raw: `${provider}: no usage gate` };
   }
-  let usedPct = null, resetsInMin = null, raw = '';
-  for (const args of [['-p', '/usage'], ['usage']]) {
-    const r = await run(bin, args, { timeoutMs: 30000 });
-    raw = `${r.out}\n${r.err}`.trim();
-    const p = parseUsage(raw);
-    if (p.usedPct != null) { usedPct = p.usedPct; resetsInMin = p.resetsInMin; break; }
-  }
-  if (usedPct != null) return { provider, usedPct, resetsInMin, limited: usedPct >= 100, readable: true, raw: raw.slice(0, 300) };
-  const probe = await run(bin, ['-p', 'ok', '--output-format', 'json'], { timeoutMs: 45000 });
+  // ONE fast rate-limit probe. We used to also try `claude -p /usage` twice for a
+  // session %, but the CLI never exposes it to scripts, so those two calls just
+  // added ~60s per cycle and made the dashboard sit on "checking usage". Gone.
+  const probe = await run(bin, ['-p', 'ok', '--output-format', 'json'], { timeoutMs: 40000 });
   const text = `${probe.out}\n${probe.err}`;
   let apiError = null;
   try { const j = JSON.parse(probe.out); apiError = j.api_error_status; } catch (_) {}
