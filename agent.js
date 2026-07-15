@@ -498,6 +498,16 @@ app.post('/claude/work', async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// One-shot completion on the owner's subscription — the hub's LLM features call
+// this so they run on Max/Pro instead of the metered API.
+app.post('/claude/complete', async (req, res) => {
+  if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });
+  const { prompt, provider } = req.body || {};
+  if (!prompt) return res.status(400).json({ error: 'prompt required' });
+  try { res.json(await claudeModule.complete({ provider: provider || 'claude', prompt })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Pre-flight: report whether a provider's CLI + its work folder are present.
 app.post('/claude/preflight', async (req, res) => {
   if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });

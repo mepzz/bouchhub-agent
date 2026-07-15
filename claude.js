@@ -101,15 +101,24 @@ function workBusy(name) {
   return { pid: w.pid, ageMin };
 }
 
-function run(cmd, args, { timeoutMs = 60000, cwd, env } = {}) {
+function run(cmd, args, { timeoutMs = 60000, cwd, env, stdinFile } = {}) {
   return new Promise((resolve) => {
-    let out = '', err = '';
-    const child = spawn(cmd, args, { cwd, shell: true, windowsHide: true, env: env ? { ...process.env, ...env } : process.env });
+    let out = '', err = '', inFd = null;
+    // Feed a file on the child's stdin when asked (used by complete() so a long
+    // prompt reaches `claude -p` without any shell-quoting/truncation).
+    let stdin = 'ignore';
+    if (stdinFile) { try { inFd = require('fs').openSync(stdinFile, 'r'); stdin = inFd; } catch (_) { stdin = 'ignore'; } }
+    const child = spawn(cmd, args, {
+      cwd, shell: true, windowsHide: true,
+      env: env ? { ...process.env, ...env } : process.env,
+      stdio: [stdin, 'pipe', 'pipe'],
+    });
+    const finish = (code, e) => { clearTimeout(killer); if (inFd != null) { try { require('fs').closeSync(inFd); } catch (_) {} } resolve({ code, out, err: e || err }); };
     const killer = setTimeout(() => { try { child.kill(); } catch (_) {} }, timeoutMs);
     child.stdout.on('data', d => { out += d; });
     child.stderr.on('data', d => { err += d; });
-    child.on('close', (code) => { clearTimeout(killer); resolve({ code, out, err }); });
-    child.on('error', (e) => { clearTimeout(killer); resolve({ code: -1, out, err: e.message }); });
+    child.on('close', (code) => finish(code));
+    child.on('error', (e) => finish(-1, e.message));
   });
 }
 
@@ -232,6 +241,30 @@ async function status(provider = 'claude') {
   const lim = parseLimit(text);
   const limited = lim.limited || apiError === 429 || /429/.test(String(apiError || ''));
   return { provider, busy: false, usedPct: null, readable: false, limited, resetsInMin: lim.resetsInMin, raw: (limited ? text : 'not rate-limited').slice(0, 300) };
+}
+
+// ── One-shot completion on the owner's SUBSCRIPTION (no API cost) ─────────────
+// Runs the provider CLI in print/one-shot mode and returns its reply text. The
+// prompt is fed on stdin so long/multi-line prompts arrive intact. This is what
+// lets the hub's LLM features (Ideas, project to-dos, …) run on the Max/Pro
+// subscription instead of the metered API — the same account the handoff uses.
+async function complete({ provider = 'claude', prompt, timeoutMs = 180000 } = {}) {
+  if (!prompt) throw new Error('complete needs a prompt');
+  const p = providerOf(provider);
+  const bin = _bins[provider] || (await resolveBin(provider)) || process.env[p.binEnv] || p.cli;
+  if (!bin) throw new Error(`${provider} CLI not found on this PC`);
+  const fs = require('fs');
+  const tmp = path.join(os.tmpdir(), `bouchhub-complete-${provider}-${Date.now()}.txt`);
+  fs.writeFileSync(tmp, prompt, 'utf8');
+  // Minimal print-mode flags per provider (no --verbose / no permission flags —
+  // a text completion uses no tools): claude/claude2 → -p, codex → exec, gemini → stdin.
+  const args = [p.subcmd, p.pipeFlag].filter(Boolean);
+  try {
+    const r = await run(bin, args, { timeoutMs, env: providerEnv(provider), stdinFile: tmp });
+    const text = (r.out || '').trim();
+    if (!text && r.code !== 0) throw new Error(`${provider} completion failed (code ${r.code}): ${(r.err || '').slice(0, 200)}`);
+    return { provider, text, code: r.code };
+  } finally { try { fs.unlinkSync(tmp); } catch (_) {} }
 }
 
 // Launch an autonomous session for `provider`, hidden in the background, teeing
@@ -357,6 +390,6 @@ function consoleTail(arg, maybeLines) {
 }
 
 module.exports = {
-  status, work, parseUsage, parseLimit, preflight, consoleTail,
+  status, work, complete, parseUsage, parseLimit, preflight, consoleTail,
   resolveBin, resolveClaude, PROVIDERS, logPathFor, workFolderFor, LOG_PATH,
 };
