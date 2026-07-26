@@ -73,7 +73,19 @@ function envKey(name) { return String(name).toUpperCase().replace(/[^A-Z0-9]/g, 
 function configDirFor(name) { return process.env[`${envKey(name)}_CONFIG_DIR`] || ''; }
 function providerEnv(name) {
   const dir = configDirFor(name);
-  return dir ? { CLAUDE_CONFIG_DIR: dir } : {};
+  const env = dir ? { CLAUDE_CONFIG_DIR: dir } : {};
+  // SUBSCRIPTION ONLY — never metered API credits. The Claude CLI bills an
+  // ANTHROPIC_API_KEY when one is present (and can silently fall back to it the
+  // moment the Max subscription window is exhausted). Blank it (+ the auth token)
+  // for the claude-family providers so the CLI always uses the logged-in Max
+  // subscription in the config dir, and simply WAITS for the window to reset
+  // instead of spending credits. Empty string (not delete) so it survives being
+  // merged over process.env at the spawn sites.
+  if (providerOf(name).cli === 'claude') {
+    env.ANTHROPIC_API_KEY = '';
+    env.ANTHROPIC_AUTH_TOKEN = '';
+  }
+  return env;
 }
 
 // Per-provider log so parallel sessions don't interleave. Claude keeps the
