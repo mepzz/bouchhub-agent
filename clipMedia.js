@@ -605,19 +605,33 @@ async function cutClip(source, start, end, outPath, { ffmpeg = ffmpegBin(), forc
 // Constrained Baseline-ish settings on purpose: yuv420p, level 4.0, no B-frames.
 // Ugly-but-plays beats pretty-but-stalls for something you only use to judge a
 // moment.
-async function makePreview(src, outPath, { ffmpeg = ffmpegBin(), maxWidth = 1280 } = {}) {
+async function makePreview(src, outPath, {
+  ffmpeg = ffmpegBin(),
+  maxWidth = parseInt(process.env.CLIPSCAN_PREVIEW_WIDTH || '960', 10),
+  maxRateK = parseInt(process.env.CLIPSCAN_PREVIEW_KBPS || '700', 10),
+} = {}) {
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  // SIZE is the constraint, not quality. These are streamed from a home
+  // connection to a phone, and an 11MB preview stalls long before it finishes
+  // — the browser reports "waiting on data that is not arriving", which reads
+  // like a broken file. A hard bitrate cap plus 30fps puts a 60s clip at a few
+  // MB, which arrives fast enough to actually watch.
   const r = await run(ffmpeg, ['-y', '-i', src,
     // Never upscale, and force even dimensions (H.264 requires them).
     '-vf', `scale='min(${maxWidth},iw)':-2`,
+    '-r', '30',
     '-c:v', 'libx264', '-profile:v', 'main', '-level:v', '4.0', '-pix_fmt', 'yuv420p',
-    '-bf', '0', '-crf', '26', '-preset', 'veryfast',
-    '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+    '-bf', '0', '-preset', 'veryfast',
+    '-crf', '30', '-maxrate', `${maxRateK}k`, '-bufsize', `${maxRateK * 2}k`,
+    '-g', '60',                                  // keyframe every 2s so seeking works
+    '-c:a', 'aac', '-b:a', '96k', '-ac', '1',    // mono is plenty for judging a moment
     '-movflags', '+faststart', outPath], { timeoutMs: 20 * 60 * 1000 });
   if (r.code !== 0 || !fs.existsSync(outPath)) return { ok: false, error: tail(r.stderr) };
   const dur = await probeDuration(outPath);
   if (dur == null || dur < 0.5) return { ok: false, error: `preview has no usable duration (${dur})` };
-  return { ok: true, duration: dur };
+  let bytes = 0;
+  try { bytes = fs.statSync(outPath).size; } catch (_) {}
+  return { ok: true, duration: dur, bytes, mb: Math.round(bytes / 1048576 * 10) / 10 };
 }
 
 async function thumbnail(video, outPath, { ffmpeg = ffmpegBin(), atS = null } = {}) {

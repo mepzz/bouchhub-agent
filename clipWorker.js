@@ -505,6 +505,10 @@ async function processRecording(agentId, rec, cfg) {
     const preview = await media.makePreview(outPath, previewPath).catch(e => ({ ok: false, error: e.message }));
     if (!preview.ok) {
       await note(agentId, 'warning', `[${label}] preview encode failed (${preview.error}) — the grid will fall back to the full-size file, which may not play in a browser.`, { recording_id: rec.id });
+    } else if (preview.mb > 8) {
+      // Previews are streamed from a home uplink to a phone; anything big enough
+      // to stall is worth flagging rather than leaving as a mystery buffer.
+      await note(agentId, 'warning', `[${label}] preview is ${preview.mb}MB — large enough to stall on a slow link. Lower CLIPSCAN_PREVIEW_KBPS if this keeps happening.`, { recording_id: rec.id });
     }
 
     const registered = await hub('POST', '/api/clipscan/cuts', {
