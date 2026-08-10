@@ -492,6 +492,32 @@ async function cutClip(source, start, end, outPath, { ffmpeg = ffmpegBin(), forc
   return { ok: false, error: tail(accurate.stderr || fast.stderr) };
 }
 
+// A browser-friendly copy of a cut, for the review grid only.
+//
+// The real cuts keep the capture's full 3840x1080 — that's what gets edited.
+// But a frame that wide in H.264 pushes past what phone browsers will decode,
+// and the symptom is nasty: it plays for a fraction of a second and stops, which
+// looks like a broken file rather than a decoder limit. So the grid streams a
+// downscaled, conservatively-encoded copy instead.
+//
+// Constrained Baseline-ish settings on purpose: yuv420p, level 4.0, no B-frames.
+// Ugly-but-plays beats pretty-but-stalls for something you only use to judge a
+// moment.
+async function makePreview(src, outPath, { ffmpeg = ffmpegBin(), maxWidth = 1280 } = {}) {
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  const r = await run(ffmpeg, ['-y', '-i', src,
+    // Never upscale, and force even dimensions (H.264 requires them).
+    '-vf', `scale='min(${maxWidth},iw)':-2`,
+    '-c:v', 'libx264', '-profile:v', 'main', '-level:v', '4.0', '-pix_fmt', 'yuv420p',
+    '-bf', '0', '-crf', '26', '-preset', 'veryfast',
+    '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+    '-movflags', '+faststart', outPath], { timeoutMs: 20 * 60 * 1000 });
+  if (r.code !== 0 || !fs.existsSync(outPath)) return { ok: false, error: tail(r.stderr) };
+  const dur = await probeDuration(outPath);
+  if (dur == null || dur < 0.5) return { ok: false, error: `preview has no usable duration (${dur})` };
+  return { ok: true, duration: dur };
+}
+
 async function thumbnail(video, outPath, { ffmpeg = ffmpegBin(), atS = null } = {}) {
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   const dur = atS != null ? atS : ((await probeDuration(video)) || 2) / 2;
@@ -504,5 +530,5 @@ module.exports = {
   inspectFolder, orderSegments, groupStreams, reconstruct,
   probeDuration, probeMedia, assessRebuild, extractAudio, loudnessTrack, findPeaks, mergeOverlaps,
   silenceGaps, snapToSilence,
-  cutClip, thumbnail,
+  cutClip, makePreview, thumbnail,
 };

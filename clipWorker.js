@@ -490,9 +490,19 @@ async function processRecording(agentId, rec, cfg) {
     const thumbPath = path.join(gameDir, `${base}_thumb.jpg`);
     await media.thumbnail(outPath, thumbPath).catch(() => false);
 
+    // Browser-playable copy for the review grid. The full-res cut above is what
+    // gets edited; a 3840-wide H.264 frame is more than phone browsers will
+    // decode, and it fails by playing a fraction of a second and stopping.
+    const previewPath = path.join(gameDir, `${base}_preview.mp4`);
+    const preview = await media.makePreview(outPath, previewPath).catch(e => ({ ok: false, error: e.message }));
+    if (!preview.ok) {
+      await note(agentId, 'warning', `[${label}] preview encode failed (${preview.error}) — the grid will fall back to the full-size file, which may not play in a browser.`, { recording_id: rec.id });
+    }
+
     const registered = await hub('POST', '/api/clipscan/cuts', {
       recording_id: rec.id, candidate_id: null, agent_id: agentId,
       output_path: outPath, thumbnail_path: fs.existsSync(thumbPath) ? thumbPath : null,
+      preview_path: preview.ok ? previewPath : null,
       start_s: s, end_s: e, score: judged.score, rationale: judged.rationale,
       goods: judged.goods || [], bads: judged.bads || [],
     }).catch(e => { note(agentId, 'warning', `[${label}] could not register a cut: ${e.message}`); return null; });
