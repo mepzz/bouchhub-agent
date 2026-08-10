@@ -550,8 +550,12 @@ app.get('/clipscan/status', (req, res) => {
 // Are ffmpeg/ffprobe actually runnable here? Surfaced so a missing tool is a
 // clear message in the UI rather than a mystery failure mid-batch.
 app.get('/clipscan/preflight', async (req, res) => {
-  try { res.json(await require('./clipMedia').preflight()); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try {
+    // Report the agent build too: the clip pipeline lives in required modules, so
+    // a running agent keeps serving old code until it restarts. Seeing the
+    // version here answers "did my fix actually land?" in one call.
+    res.json({ agentVersion: AGENT_VERSION, ...(await require('./clipMedia').preflight()) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // What does a real Steam clip folder actually look like? Steam's layout varies
