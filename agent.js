@@ -524,6 +524,52 @@ app.post('/claude/console', async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Clip Scanning ────────────────────────────────────────────────────────────
+// N worker loops that claim recordings from the hub and run the ffmpeg →
+// audio-detect → transcribe → score → cut pipeline locally, where the footage is.
+let clipWorker = null;
+try { clipWorker = require('./clipWorker'); }
+catch (e) { console.warn('[Agent] clip worker unavailable:', e.message); }
+
+app.post('/clipscan/start', async (req, res) => {
+  if (!clipWorker) return res.status(503).json({ error: 'clip worker unavailable' });
+  try { res.json(await clipWorker.start({ count: (req.body || {}).count })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/clipscan/stop', (req, res) => {
+  if (!clipWorker) return res.status(503).json({ error: 'clip worker unavailable' });
+  res.json(clipWorker.stop());
+});
+
+app.get('/clipscan/status', (req, res) => {
+  if (!clipWorker) return res.status(503).json({ error: 'clip worker unavailable' });
+  res.json(clipWorker.status());
+});
+
+// Are ffmpeg/ffprobe actually runnable here? Surfaced so a missing tool is a
+// clear message in the UI rather than a mystery failure mid-batch.
+app.get('/clipscan/preflight', async (req, res) => {
+  try { res.json(await require('./clipMedia').preflight()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// What does a real Steam clip folder actually look like? Steam's layout varies
+// by client version, so this reports what's on disk for one folder.
+app.post('/clipscan/inspect', (req, res) => {
+  const { folder } = req.body || {};
+  if (!folder) return res.status(400).json({ error: 'folder is required' });
+  try {
+    const info = require('./clipMedia').inspectFolder(folder);
+    res.json({
+      layout: info.layout,
+      manifest: info.manifest,
+      counts: { files: info.files.length, segments: info.segments.length, inits: info.inits.length },
+      sample: info.files.slice(0, 40),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/browser/instagram/login', async (req, res) => {
   if (!browserModule) return res.status(503).json({ error: 'Playwright not installed' });
   const username = process.env.INSTAGRAM_USERNAME;
