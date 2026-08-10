@@ -250,9 +250,48 @@ async function loudnessTrack(wav, { ffmpeg = ffmpegBin(), windowS = 0.5 } = {}) 
   return out;
 }
 
+// Where does speech stop? Used to snap cut boundaries to natural conversation
+// breaks so a clip never starts or ends mid-word — the difference between a
+// postable clip and a fragment. Returns [{start, end}] of the silent stretches.
+async function silenceGaps(wav, { ffmpeg = ffmpegBin(), noiseDb = -32, minDurS = 0.35 } = {}) {
+  const r = await run(ffmpeg, ['-i', wav, '-af', `silencedetect=noise=${noiseDb}dB:d=${minDurS}`, '-f', 'null', '-'],
+    { timeoutMs: 15 * 60 * 1000 });
+  const text = `${r.stdout}\n${r.stderr}`;
+  const gaps = [];
+  let pending = null;
+  const re = /silence_(start|end):\s*(-?[\d.]+)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const t = parseFloat(m[2]);
+    if (!Number.isFinite(t)) continue;
+    if (m[1] === 'start') pending = t;
+    else if (pending != null) { gaps.push({ start: pending, end: t }); pending = null; }
+  }
+  return gaps;
+}
+
+// Move a cut boundary to the nearest conversation break within `windowS`.
+// `edge` = 'start' snaps to the END of a gap (begin as speech resumes);
+// 'end' snaps to the START of a gap (stop as speech finishes).
+function snapToSilence(t, gaps, { edge = 'start', windowS = 2.5 } = {}) {
+  if (!gaps || !gaps.length) return t;
+  let best = t, bestDist = Infinity;
+  for (const g of gaps) {
+    const cand = edge === 'start' ? g.end : g.start;
+    const dist = Math.abs(cand - t);
+    if (dist < bestDist && dist <= windowS) { best = cand; bestDist = dist; }
+  }
+  return Math.round(best * 100) / 100;
+}
+
 // Find moments that rise sharply above a ROLLING baseline — that's what a
 // laughter burst or a group reaction looks like, and it adapts to clips that are
 // loud or quiet overall instead of using one global threshold.
+//
+// NOTE: this is now a SUPPORTING signal, not the primary one. Loudness alone
+// finds "something happened here", which is not the same as a postable moment —
+// the transcript-driven selection in clipWorker does the actual choosing, and
+// uses these peaks as an annotation of where the energy is.
 //
 // Pure function over the loudness track, so it's unit-testable with no audio.
 function findPeaks(track, {
@@ -374,5 +413,6 @@ module.exports = {
   findTool, ffmpegBin, ffprobeBin, preflight, run,
   inspectFolder, orderSegments, groupStreams, reconstruct,
   probeDuration, extractAudio, loudnessTrack, findPeaks, mergeOverlaps,
+  silenceGaps, snapToSilence,
   cutClip, thumbnail,
 };

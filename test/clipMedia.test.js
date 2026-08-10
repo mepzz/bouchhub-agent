@@ -231,6 +231,60 @@ test('a recording shorter than the minimum yields what exists, not a negative wi
   assert.ok(w.end > w.start, 'still a real window');
 });
 
+// ── Conversation-break snapping ──────────────────────────────────────────────
+test('cut boundaries snap to natural conversation breaks', () => {
+  const gaps = [{ start: 9.5, end: 10.2 }, { start: 38.0, end: 39.1 }];
+  // A start near a gap begins where speech RESUMES, not mid-silence.
+  assert.strictEqual(media.snapToSilence(10.0, gaps, { edge: 'start' }), 10.2);
+  // An end near a gap stops where speech FINISHES.
+  assert.strictEqual(media.snapToSilence(38.4, gaps, { edge: 'end' }), 38.0);
+});
+
+test('a boundary far from any break is left where it is', () => {
+  const gaps = [{ start: 9.5, end: 10.2 }];
+  assert.strictEqual(media.snapToSilence(200, gaps, { edge: 'start' }), 200, 'no gap within the window → unchanged');
+  assert.strictEqual(media.snapToSilence(50, [], { edge: 'start' }), 50, 'no gaps at all → unchanged');
+});
+
+// ── The transcript timeline the picker reads ─────────────────────────────────
+test('the timeline gives the model every line with a timestamp', () => {
+  const tl = worker.buildTimeline(
+    [{ start: 5, end: 8, text: 'where did he go' }, { start: 65, end: 67, text: 'no way' }],
+    [{ start_s: 64, end_s: 68, audio_score: 0.9 }],
+    120,
+  );
+  assert.ok(tl.includes('where did he go'), 'includes what was said');
+  assert.ok(tl.includes('[0:05'), 'timestamps each line');
+  assert.ok(tl.includes('[1:05'), 'formats past a minute correctly');
+  assert.ok(tl.includes('🔊'), 'marks where the reaction energy is');
+});
+
+test('a loud reaction with no words still reaches the model', () => {
+  // Pure laughter/screaming has no transcript line, but it is exactly the kind
+  // of moment worth clipping — it must not vanish from the timeline.
+  const tl = worker.buildTimeline([{ start: 5, end: 8, text: 'hello' }], [{ start_s: 90, end_s: 95, audio_score: 0.95 }], 120);
+  assert.ok(/loud reaction, no words/.test(tl), 'wordless reactions are surfaced');
+  assert.ok(tl.indexOf('hello') < tl.indexOf('loud reaction'), 'the timeline stays in chronological order');
+});
+
+test('an empty recording produces an empty timeline rather than throwing', () => {
+  assert.strictEqual(worker.buildTimeline([], [], 100), '');
+  assert.strictEqual(worker.buildTimeline(null, null, 100), '');
+});
+
+test('timestamps are formatted for a human/model to read', () => {
+  assert.strictEqual(worker.fmtTs(0), '0:00');
+  assert.strictEqual(worker.fmtTs(9), '0:09');
+  assert.strictEqual(worker.fmtTs(75), '1:15');
+  assert.strictEqual(worker.fmtTs(605), '10:05');
+});
+
+test('the clip length window is the postable range, not fragments', () => {
+  // Regression on the whole complaint: 7s produced unpostable 3s-feeling clips.
+  assert.deepStrictEqual(worker.FALLBACK_RUBRIC.ideal_length_s, [20, 60],
+    'the fallback rubric targets the short-form range');
+});
+
 test('there is always a rubric to judge against', () => {
   assert.ok(worker.FALLBACK_RUBRIC.winning_patterns.length, 'the fallback has real content');
   assert.strictEqual(worker.FALLBACK_RUBRIC._fallback, true, 'and is flagged so a degraded run is visible');
