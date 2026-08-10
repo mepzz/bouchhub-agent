@@ -55,6 +55,20 @@ test('detects an already-complete single mp4', () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('a folder with BOTH a manifest and many segments still exposes the segments', () => {
+  // Steam writes a live/rolling manifest alongside the real segments: the .mpd
+  // advertises only the currently-available window, so remuxing it yields ~3s
+  // while hundreds of segments sit on disk. reconstruct() must therefore be able
+  // to see and prefer the segments — the manifest is a fallback, not the plan.
+  const files = ['session.mpd', 'init-stream0.m4s'];
+  for (let i = 2035; i < 2060; i++) files.push(`chunk-stream0-0${i}.m4s`);
+  const dir = mk(files);
+  const info = media.inspectFolder(dir);
+  assert.ok(info.manifest, 'the manifest is found');
+  assert.ok(info.segments.length > 20, 'and so are all the segments');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('an unrecognizable folder reports "unknown" rather than guessing', () => {
   const dir = mk(['notes.txt', 'thumbnail.png']);
   assert.strictEqual(media.inspectFolder(dir).layout, 'unknown');

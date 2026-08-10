@@ -177,19 +177,25 @@ async function reconstruct(folder, outPath, { ffmpeg = ffmpegBin(), onLog } = {}
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   log(`layout=${info.layout} files=${info.files.length} segments=${info.segments.length}`);
 
-  if (info.layout === 'dash-manifest') {
-    const r = await run(ffmpeg, ['-y', '-i', info.manifest, '-c', 'copy', outPath]);
-    if (r.code === 0 && fs.existsSync(outPath)) return { ok: true, strategy: 'mpd-remux', info };
-    log(`mpd remux failed: ${tail(r.stderr)}`);
-  }
+  // How long SHOULD this be? DASH segments run ~2-6s each, so even a very
+  // conservative 1.5s/segment tells us whether a rebuild kept the recording or
+  // threw it away. Used to reject a strategy that "succeeded" but produced
+  // almost nothing.
+  const expectAtLeastS = info.segments.length > 1 ? info.segments.length * 1.5 : 0;
+  const plausible = async () => {
+    const d = await probeDuration(outPath);
+    if (d == null) return { ok: false, d };
+    return { ok: d >= Math.min(expectAtLeastS, 30) || expectAtLeastS === 0, d };
+  };
 
-  if (info.layout === 'single-file') {
-    const r = await run(ffmpeg, ['-y', '-i', info.whole, '-c', 'copy', outPath]);
-    if (r.code === 0 && fs.existsSync(outPath)) return { ok: true, strategy: 'single-remux', info };
-    log(`single-file remux failed: ${tail(r.stderr)}`);
-  }
-
-  if (info.segments.length) {
+  // Concatenating the segments comes FIRST when there are many of them.
+  //
+  // Steam writes a LIVE/rolling-buffer manifest: it advertises only the segments
+  // currently "available", so ffmpeg reading the .mpd pulls a single segment and
+  // reports ~3s — while hundreds of segments sit on disk beside it. Trusting the
+  // manifest first is exactly backwards for this content, so it is now only a
+  // fallback for when there is nothing to concatenate.
+  if (info.segments.length > 1) {
     const streams = groupStreams(info.segments);
     const keys = Object.keys(streams);
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'clipcat-'));
@@ -229,18 +235,51 @@ async function reconstruct(folder, outPath, { ffmpeg = ffmpegBin(), onLog } = {}
       args.push('-c', 'copy', '-movflags', '+faststart', outPath);
       const r = await run(ffmpeg, args, { timeoutMs: 45 * 60 * 1000 });
       if (r.code === 0 && fs.existsSync(outPath)) {
-        return { ok: true, strategy: parts.length > 1 ? 'segment-concat-mux' : 'segment-concat', info };
+        const p = await plausible();
+        if (p.ok) {
+          return { ok: true, strategy: parts.length > 1 ? 'segment-concat-mux' : 'segment-concat', info, duration: p.d };
+        }
+        log(`segment concat produced only ${p.d}s from ${info.segments.length} segment(s) — trying the manifest`);
+      } else {
+        log(`segment concat failed: ${tail(r.stderr)}`);
       }
-      log(`segment concat failed: ${tail(r.stderr)}`);
     } finally {
       try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
     }
   }
 
+  // Fallbacks. The manifest is LAST for segmented content (see above), but it's
+  // the right answer when there's nothing else to work from.
+  if (info.manifest) {
+    const r = await run(ffmpeg, ['-y', '-i', info.manifest, '-c', 'copy', '-movflags', '+faststart', outPath],
+      { timeoutMs: 45 * 60 * 1000 });
+    if (r.code === 0 && fs.existsSync(outPath)) {
+      const p = await plausible();
+      if (p.ok) return { ok: true, strategy: 'mpd-remux', info, duration: p.d };
+      log(`mpd remux produced only ${p.d}s (Steam's manifest advertises a live window, not the whole buffer)`);
+    } else {
+      log(`mpd remux failed: ${tail(r.stderr)}`);
+    }
+  }
+
+  if (info.whole) {
+    const r = await run(ffmpeg, ['-y', '-i', info.whole, '-c', 'copy', '-movflags', '+faststart', outPath]);
+    if (r.code === 0 && fs.existsSync(outPath)) {
+      const p = await plausible();
+      if (p.ok || info.segments.length <= 1) return { ok: true, strategy: 'single-remux', info, duration: p.d };
+    }
+    log(`single-file remux failed or came up short: ${tail(r.stderr)}`);
+  }
+
+  // Nothing produced a plausible length. Keep whatever is on disk if it's at
+  // least playable, but report it as a failure so the recording is flagged
+  // rather than silently yielding a handful of unusable cuts.
+  const last = fs.existsSync(outPath) ? await probeDuration(outPath) : null;
   return {
-    ok: false, strategy: null, info,
-    error: `could not reconstruct (layout=${info.layout}). Files seen: ` +
-      info.files.slice(0, 12).map(f => path.basename(f)).join(', ') + (info.files.length > 12 ? ' …' : ''),
+    ok: false, strategy: null, info, duration: last,
+    error: `could not rebuild a plausible recording (layout=${info.layout}, ${info.segments.length} segment(s)` +
+      `${last != null ? `, best attempt was only ${Math.round(last)}s` : ''}). Files seen: ` +
+      info.files.slice(0, 8).map(f => path.basename(f)).join(', ') + (info.files.length > 8 ? ' …' : ''),
   };
 }
 
