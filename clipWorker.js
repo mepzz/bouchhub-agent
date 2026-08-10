@@ -591,6 +591,29 @@ function stop() {
   return { running: false };
 }
 
+// Called on agent boot. `running` lives in this process, so every agent update
+// left the workers stopped while the dashboard still showed them started — the
+// batch just quietly stalled. The hub remembers the intent, so ask it.
+//
+// Retries for a while: the agent usually comes up before the hub is reachable,
+// and giving up on the first connection error would reintroduce the exact
+// problem this exists to fix.
+async function resume({ attempts = 10, delayMs = 15000 } = {}) {
+  if (!HUB_URL || !AGENT_SECRET) return { running: false, reason: 'agent is not configured for the hub' };
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await hub('GET', '/api/clipscan/workers/desired', null, { timeoutMs: 15000 });
+      if (!r || !r.running) return { running: false, reason: 'the hub says the workers should be stopped' };
+      const started = await start();
+      if (started.running) await note(null, 'coordination', 'Clip-scan workers resumed automatically after an agent restart.');
+      return started;
+    } catch (_) {
+      await sleep(delayMs);   // hub not up yet — keep trying
+    }
+  }
+  return { running: false, reason: 'could not reach the hub to ask whether to resume' };
+}
+
 function status() {
   return {
     running, workers: loops.length,
@@ -599,7 +622,7 @@ function status() {
 }
 
 module.exports = {
-  start, stop, status,
+  start, stop, status, resume,
   // exported for tests
   attachTranscripts, extractJson, transcribe, processRecording, sanitizeName,
   clampWindow, FALLBACK_RUBRIC, buildTimeline, selectMoments, fmtTs,

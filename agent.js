@@ -531,6 +531,17 @@ let clipWorker = null;
 try { clipWorker = require('./clipWorker'); }
 catch (e) { console.warn('[Agent] clip worker unavailable:', e.message); }
 
+// Pick a batch back up after an agent restart. The worker's running flag lives
+// in this process, so an update used to leave the workers silently stopped while
+// the dashboard still showed them running; the hub remembers the intent.
+if (clipWorker) {
+  setTimeout(() => {
+    clipWorker.resume()
+      .then(r => console.log(`[Agent] clip-scan resume: ${r.running ? `running ${r.workers} worker(s)` : (r.reason || 'not resuming')}`))
+      .catch(e => console.warn('[Agent] clip-scan resume failed:', e.message));
+  }, 10000).unref?.();
+}
+
 app.post('/clipscan/start', async (req, res) => {
   if (!clipWorker) return res.status(503).json({ error: 'clip worker unavailable' });
   try { res.json(await clipWorker.start({ count: (req.body || {}).count })); }
