@@ -193,11 +193,16 @@ async function reconstruct(folder, outPath, { ffmpeg = ffmpegBin(), onLog } = {}
         await new Promise(res => out.on('close', res));
         parts.push(joined);
       }
-      const args = ['-y'];
+      // +genpts rebuilds presentation timestamps. Byte-concatenated fragments
+      // frequently carry gaps or non-monotonic PTS, and a plain `-c copy` remux
+      // preserves that damage — the rebuilt file then reports a bogus duration
+      // and every later seek lands in the wrong place, which is how a 20s cut
+      // request comes back as 3 seconds of video.
+      const args = ['-y', '-fflags', '+genpts'];
       for (const p of parts) args.push('-i', p);
       // Map every input's streams into one file.
       parts.forEach((_, i) => args.push('-map', String(i)));
-      args.push('-c', 'copy', outPath);
+      args.push('-c', 'copy', '-movflags', '+faststart', outPath);
       const r = await run(ffmpeg, args);
       if (r.code === 0 && fs.existsSync(outPath)) {
         return { ok: true, strategy: parts.length > 1 ? 'segment-concat-mux' : 'segment-concat', info };
@@ -223,6 +228,46 @@ async function probeDuration(file, { ffprobe = ffprobeBin() } = {}) {
     '-of', 'default=noprint_wrappers=1:nokey=1', file], { timeoutMs: 60000 });
   const d = parseFloat(String(r.stdout).trim());
   return Number.isFinite(d) ? d : null;
+}
+
+// Full probe of a produced file: duration, and what streams it actually has.
+// Reported to the notes board after reconstruction so a bad rebuild is visible
+// immediately instead of being inferred from strange cuts much later.
+async function probeMedia(file, { ffprobe = ffprobeBin() } = {}) {
+  const r = await run(ffprobe, ['-v', 'error', '-show_entries',
+    'format=duration,size:stream=codec_type,codec_name,width,height,nb_frames',
+    '-of', 'json', file], { timeoutMs: 120000 });
+  try {
+    const j = JSON.parse(r.stdout || '{}');
+    const streams = (j.streams || []).map(s => ({
+      type: s.codec_type, codec: s.codec_name,
+      size: s.width ? `${s.width}x${s.height}` : null,
+      frames: s.nb_frames ? Number(s.nb_frames) : null,
+    }));
+    return {
+      ok: true,
+      duration: j.format && j.format.duration ? parseFloat(j.format.duration) : null,
+      bytes: j.format && j.format.size ? Number(j.format.size) : null,
+      streams,
+      hasVideo: streams.some(s => s.type === 'video'),
+      hasAudio: streams.some(s => s.type === 'audio'),
+    };
+  } catch (_) {
+    return { ok: false, error: tail(r.stderr), streams: [] };
+  }
+}
+
+// Does a rebuilt recording look sane? A Steam clip is minutes long; a rebuild
+// that probes to a few seconds, or has no video/audio, means the reconstruction
+// went wrong and everything downstream will inherit the damage.
+function assessRebuild(probe, { minPlausibleS = 20 } = {}) {
+  const problems = [];
+  if (!probe || !probe.ok) return { ok: false, problems: ['could not probe the rebuilt file'] };
+  if (!probe.hasVideo) problems.push('no video stream');
+  if (!probe.hasAudio) problems.push('no audio stream — nothing to listen to');
+  if (probe.duration == null) problems.push('no readable duration (timestamps are probably broken)');
+  else if (probe.duration < minPlausibleS) problems.push(`only ${Math.round(probe.duration)}s long — the rebuild almost certainly dropped most of the recording`);
+  return { ok: problems.length === 0, problems };
 }
 
 async function extractAudio(video, wavOut, { ffmpeg = ffmpegBin() } = {}) {
@@ -388,18 +433,39 @@ async function cutClip(source, start, end, outPath, { ffmpeg = ffmpegBin(), forc
     }
   }
 
-  // Accurate seek: -ss before -i for speed, then -ss 0 semantics are handled by
-  // ffmpeg's decode-and-discard, so the first output frame is a real keyframe.
-  const r2 = await run(ffmpeg, ['-y', '-ss', String(start), '-i', source, '-t', String(dur),
-    '-c:v', 'libx264', '-crf', '20', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', outPath]);
-  if (r2.code === 0 && fs.existsSync(outPath)) {
-    const got = await probeDuration(outPath);
-    // A file that exists but has no measurable duration is broken, not a success.
-    if (got == null || got < 0.5) return { ok: false, error: `output has no usable duration (${got})` };
-    return { ok: true, mode: 'encode', duration: got };
+  // Fast seek: -ss before -i. Cheap, but it relies on the source's timestamps
+  // being sane — and a rebuilt-from-fragments MP4 often has gaps or non-monotonic
+  // PTS, in which case ffmpeg silently emits a few seconds instead of what was
+  // asked for. So we ALWAYS verify the result against what we requested.
+  const enc = ['-c:v', 'libx264', '-crf', '20', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart'];
+  const fast = await run(ffmpeg, ['-y', '-ss', String(start), '-i', source, '-t', String(dur), ...enc, outPath]);
+  let got = (fast.code === 0 && fs.existsSync(outPath)) ? await probeDuration(outPath) : null;
+
+  if (got != null && got >= dur * 0.8) return { ok: true, mode: 'encode', duration: got, requested: dur };
+
+  // Short output → the source's timestamps can't be trusted. Redo it with an
+  // ACCURATE seek (-ss AFTER -i, so ffmpeg decodes from the start and counts
+  // frames rather than trusting PTS) plus -fflags +genpts to rebuild timestamps.
+  // Much slower on a long recording, but it produces the length actually asked
+  // for — which is the difference between a postable clip and a 3-second stub.
+  const accurate = await run(ffmpeg, ['-y', '-fflags', '+genpts', '-i', source,
+    '-ss', String(start), '-t', String(dur), ...enc, outPath], { timeoutMs: 30 * 60 * 1000 });
+  if (accurate.code === 0 && fs.existsSync(outPath)) {
+    const got2 = await probeDuration(outPath);
+    if (got2 != null && got2 >= 0.5) {
+      return {
+        ok: true, mode: 'encode-accurate', duration: got2, requested: dur,
+        short: got2 < dur * 0.8 ? `asked for ${Math.round(dur)}s, got ${Math.round(got2)}s` : null,
+      };
+    }
   }
-  return { ok: false, error: tail(r2.stderr) };
+  if (got != null && got >= 0.5) {
+    // Accurate seek failed too — keep the short one rather than losing the moment,
+    // but report that it's short so it's visible rather than mysterious.
+    return { ok: true, mode: 'encode-short', duration: got, requested: dur, short: `asked for ${Math.round(dur)}s, got ${Math.round(got)}s` };
+  }
+  return { ok: false, error: tail(accurate.stderr || fast.stderr) };
 }
 
 async function thumbnail(video, outPath, { ffmpeg = ffmpegBin(), atS = null } = {}) {
@@ -412,7 +478,7 @@ async function thumbnail(video, outPath, { ffmpeg = ffmpegBin(), atS = null } = 
 module.exports = {
   findTool, ffmpegBin, ffprobeBin, preflight, run,
   inspectFolder, orderSegments, groupStreams, reconstruct,
-  probeDuration, extractAudio, loudnessTrack, findPeaks, mergeOverlaps,
+  probeDuration, probeMedia, assessRebuild, extractAudio, loudnessTrack, findPeaks, mergeOverlaps,
   silenceGaps, snapToSilence,
   cutClip, thumbnail,
 };

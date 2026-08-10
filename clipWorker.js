@@ -364,10 +364,24 @@ async function processRecording(agentId, rec, cfg) {
     await setStatus(agentId, rec.id, 'error', { error_msg: built.error });
     return;
   }
-  const duration = await media.probeDuration(mp4);
+  // Probe the rebuild and REPORT it. A bad reconstruction poisons everything
+  // downstream (a 20s cut request coming back as 3s of video, say), so surface
+  // exactly what came out instead of leaving it to be inferred from odd clips.
+  const probe = await media.probeMedia(mp4);
+  const duration = probe.duration;
+  const health = media.assessRebuild(probe);
   await note(agentId, 'coordination',
-    `[${label}] rebuilt via ${built.strategy} (layout ${built.info.layout}), ${duration ? Math.round(duration) + 's' : 'unknown length'}.`,
+    `[${label}] rebuilt via ${built.strategy} (layout ${built.info.layout}) — ` +
+    `${duration ? Math.round(duration) + 's' : 'unknown length'}, ` +
+    `${(probe.streams || []).map(s => `${s.type}/${s.codec}${s.size ? ' ' + s.size : ''}`).join(' + ') || 'no streams'}.`,
     { recording_id: rec.id });
+  if (!health.ok) {
+    await note(agentId, 'warning',
+      `[${label}] the rebuilt recording looks wrong: ${health.problems.join('; ')}. ` +
+      `Source layout was "${built.info.layout}" with ${built.info.segments.length} segment(s). ` +
+      `Cuts from this recording will be unreliable.`,
+      { recording_id: rec.id });
+  }
 
   // 2. LISTEN to the whole thing. Transcribing only slivers around audio spikes
   // was the original mistake — it meant the picker never knew what was actually
@@ -467,6 +481,11 @@ async function processRecording(agentId, rec, cfg) {
     if (!cut.ok) {
       await note(agentId, 'warning', `[${label}] cut failed at ${s}s: ${cut.error}`, { recording_id: rec.id });
       continue;
+    }
+    // ffmpeg emitting less than we asked for means the source's timestamps are
+    // unreliable — say so per clip rather than leaving short clips unexplained.
+    if (cut.short) {
+      await note(agentId, 'warning', `[${label}] clip at ${Math.round(s)}s is short — ${cut.short}. The rebuilt recording's timestamps are unreliable.`, { recording_id: rec.id });
     }
     const thumbPath = path.join(gameDir, `${base}_thumb.jpg`);
     await media.thumbnail(outPath, thumbPath).catch(() => false);
