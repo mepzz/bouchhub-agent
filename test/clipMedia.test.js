@@ -69,6 +69,33 @@ test('orders segments numerically, not lexically, with init first', () => {
     'seg10 must come after seg2 — lexical sort would corrupt the video');
 });
 
+// Steam Game Recording's REAL layout, taken off the live box:
+//   video/bg_<appid>_<date>_<time>/init-stream<N>.m4s + chunk-stream<N>-#####.m4s
+// (clips/clip_* folders are empty bookmarks — no footage at all, which is why
+// pointing the pipeline at them produced 3-second scraps.)
+test('groups real Steam DASH chunks by stream index', () => {
+  const g = media.groupStreams([
+    '/bg/init-stream0.m4s', '/bg/chunk-stream0-02035.m4s', '/bg/chunk-stream0-02036.m4s',
+    '/bg/init-stream1.m4s', '/bg/chunk-stream1-02035.m4s',
+  ]);
+  assert.deepStrictEqual(Object.keys(g).sort(), ['stream0', 'stream1'],
+    'video and audio chunks land in separate streams, not one bucket');
+  assert.strictEqual(g.stream0.length, 3);
+  assert.strictEqual(g.stream1.length, 2);
+});
+
+test('each stream leads with its own init segment', () => {
+  const g = media.groupStreams(['/bg/chunk-stream0-02036.m4s', '/bg/init-stream0.m4s', '/bg/chunk-stream0-02035.m4s']);
+  assert.match(path.basename(g.stream0[0]), /^init/, 'the moov comes first or nothing decodes');
+});
+
+test('five-digit chunk numbers order correctly across a long session', () => {
+  // A real session is ~277 chunks numbered from 02035 upward.
+  const files = ['/bg/chunk-stream0-02310.m4s', '/bg/chunk-stream0-02035.m4s', '/bg/chunk-stream0-02100.m4s', '/bg/init-stream0.m4s'];
+  assert.deepStrictEqual(media.orderSegments(files).map(f => path.basename(f)),
+    ['init-stream0.m4s', 'chunk-stream0-02035.m4s', 'chunk-stream0-02100.m4s', 'chunk-stream0-02310.m4s']);
+});
+
 test('separates audio and video streams for muxing', () => {
   const groups = media.groupStreams([
     '/c/video/init.m4s', '/c/video/seg1.m4s', '/c/audio/init.m4s', '/c/audio/seg1.m4s',

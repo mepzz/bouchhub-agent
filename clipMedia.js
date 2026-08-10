@@ -143,15 +143,28 @@ function orderSegments(files) {
   return [...inits, ...rest];
 }
 
-// Group segments into streams (video/audio) when the folder separates them, so
-// each stream is concatenated on its own before being muxed together.
+// Group segments into streams so each is concatenated on its own before being
+// muxed together.
+//
+// Steam Game Recording writes MPEG-DASH:  init-stream<N>.m4s  +
+// chunk-stream<N>-#####.m4s, where N is the stream index (0 = video, 1 = audio,
+// typically). Grouping by that index is what keeps the video and audio chunks
+// from being concatenated into each other — the earlier heuristic looked for the
+// words "video"/"audio" in the path, which these filenames don't contain, so
+// every chunk fell into one bucket.
 function groupStreams(segments) {
   const groups = {};
   for (const s of segments) {
-    const rel = s.toLowerCase();
-    const key = /audio|\baud\b|\.cmfa|_a_|track1/.test(rel) ? 'audio'
-      : /video|\bvid\b|\.cmfv|_v_|track0/.test(rel) ? 'video'
-        : path.dirname(s);
+    // The stream index comes from the FILENAME (Steam's DASH naming); the
+    // video/audio keywords may legitimately live in the DIRECTORY instead, which
+    // is how other clients separate the two.
+    const base = path.basename(s).toLowerCase();
+    const full = s.toLowerCase();
+    const dash = base.match(/stream(\d+)/);
+    const key = dash ? `stream${dash[1]}`
+      : /audio|\baud\b|\.cmfa|_a_|track1/.test(full) ? 'audio'
+        : /video|\bvid\b|\.cmfv|_v_|track0/.test(full) ? 'video'
+          : path.dirname(s);
     (groups[key] = groups[key] || []).push(s);
   }
   return Object.fromEntries(Object.entries(groups).map(([k, v]) => [k, orderSegments(v)]));
@@ -186,11 +199,22 @@ async function reconstruct(folder, outPath, { ffmpeg = ffmpegBin(), onLog } = {}
       // the moov and each fragment is self-describing.
       const parts = [];
       for (const k of keys) {
+        const segs = streams[k];
+        // Without the init segment a fragmented stream has no moov and is not
+        // decodable — say so rather than producing a mystery failure.
+        if (!segs.some(f => /init/i.test(path.basename(f)))) {
+          log(`stream "${k}": no init segment found among ${segs.length} fragment(s) — it may not decode`);
+        }
         const joined = path.join(tmp, `${sanitize(k)}.mp4`);
         const out = fs.createWriteStream(joined);
-        for (const seg of streams[k]) out.write(fs.readFileSync(seg));
+        // Stream the fragments through rather than buffering each one: a session
+        // is hundreds of chunks and several hundred MB.
+        for (const seg of segs) {
+          if (!out.write(fs.readFileSync(seg))) await new Promise(res => out.once('drain', res));
+        }
         out.end();
         await new Promise(res => out.on('close', res));
+        log(`stream "${k}": joined ${segs.length} fragment(s) → ${Math.round(fs.statSync(joined).size / 1048576)}MB`);
         parts.push(joined);
       }
       // +genpts rebuilds presentation timestamps. Byte-concatenated fragments
@@ -203,7 +227,7 @@ async function reconstruct(folder, outPath, { ffmpeg = ffmpegBin(), onLog } = {}
       // Map every input's streams into one file.
       parts.forEach((_, i) => args.push('-map', String(i)));
       args.push('-c', 'copy', '-movflags', '+faststart', outPath);
-      const r = await run(ffmpeg, args);
+      const r = await run(ffmpeg, args, { timeoutMs: 45 * 60 * 1000 });
       if (r.code === 0 && fs.existsSync(outPath)) {
         return { ok: true, strategy: parts.length > 1 ? 'segment-concat-mux' : 'segment-concat', info };
       }
