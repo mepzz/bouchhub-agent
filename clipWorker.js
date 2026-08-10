@@ -132,16 +132,36 @@ function extractJson(text) {
 
 // ── The viral rubric ─────────────────────────────────────────────────────────
 // Studied once per game under its own claim. Other loops just read it.
+// A sane default so a candidate is NEVER judged with no rubric at all. Scoring
+// blind produces "no rubric details provided to confirm fit" in every rationale,
+// which is useless feedback.
+const FALLBACK_RUBRIC = {
+  ideal_length_s: [8, 22],
+  hook: 'payoff visible in the first 1-2s',
+  winning_patterns: ['genuine group laughter', 'last-second escape', 'absurd failure', 'sudden reveal'],
+  caption_style: 'short, reaction-led, lowercase',
+  pacing: 'one clear payoff, no slow lead-in',
+  avoid: ['long setup', 'dead air', 'context that needs explaining'],
+  _fallback: true,
+};
+
 async function ensureRubric(agentId, appId, gameName) {
   const existing = await hub('GET', `/api/clipscan/game_meta/${appId}`).catch(() => null);
   if (existing && existing.studied) return existing;
 
   const claim = await hub('POST', '/api/clipscan/study/claim', { agent_id: agentId, app_id: appId }).catch(() => null);
   if (!claim || !claim.ok) {
-    // Another loop is on it (or it just landed) — wait briefly, then use whatever
-    // exists. Never block a recording forever on the study.
-    await sleep(15000);
-    return await hub('GET', `/api/clipscan/game_meta/${appId}`).catch(() => null);
+    // Another loop is studying. Studying takes a browser fetch plus a model call,
+    // so a single 15s wait was far too short — the other three agents all gave up
+    // and scored their whole batch with a null rubric. Poll until it lands.
+    for (let i = 0; i < 20; i++) {
+      await sleep(15000);
+      const got = await hub('GET', `/api/clipscan/game_meta/${appId}`).catch(() => null);
+      if (got && got.studied) return got;
+      await beat(agentId, `Waiting on the ${gameName || appId} rubric (${(i + 1) * 15}s)`, 'studying');
+    }
+    // The studier died or is wedged. Take the study over rather than scoring blind.
+    await note(agentId, 'warning', `Rubric for ${gameName || appId} never landed — agent ${agentId} is taking the study over.`);
   }
 
   await beat(agentId, `Studying what's going viral for ${gameName || appId}`, 'studying');
@@ -159,15 +179,10 @@ async function ensureRubric(agentId, appId, gameName) {
     `Be concrete and specific to THIS game's moment-to-moment action, not generic advice.`,
   ].join('\n');
 
-  const rubric = extractJson(await ask(prompt)) || {
-    ideal_length_s: [8, 22],
-    hook: 'payoff visible in the first 1-2s',
-    winning_patterns: ['genuine group laughter', 'last-second escape', 'absurd failure'],
-    caption_style: 'short, reaction-led, lowercase',
-    pacing: 'one clear payoff, no slow lead-in',
-    avoid: ['long setup', 'dead air', 'context that needs explaining'],
-    _note: 'fallback rubric — the study step could not produce JSON',
-  };
+  const rubric = extractJson(await ask(prompt).catch(() => '')) || FALLBACK_RUBRIC;
+  if (rubric._fallback) {
+    await note(agentId, 'warning', `Could not study ${gameName || appId} virals — using a generic rubric. Scores will be less game-specific.`);
+  }
 
   return await hub('POST', `/api/clipscan/game_meta/${appId}`, {
     agent_id: agentId, rubric, game_name: gameName,
@@ -196,6 +211,29 @@ async function gatherReferences(gameName) {
 }
 
 // ── Scoring ──────────────────────────────────────────────────────────────────
+// The judge's `recommended_length_s` is a SUGGESTION, not a licence to produce
+// something unpostable — trusting it blindly emitted a 3s clip when the
+// configured minimum was 7s. Clamp it back into the length window (growing
+// around the midpoint if it came back too short), then fit it inside the
+// recording while preserving the length wherever there's room.
+function clampWindow(recommended, candidate, clipLenS = [7, 30], durationS = null) {
+  const [minLen, maxLen] = clipLenS;
+  let s, e;
+  if (Array.isArray(recommended) && recommended.length === 2) [s, e] = recommended.map(Number);
+  if (!(Number.isFinite(s) && Number.isFinite(e)) || e <= s) { s = candidate.start_s; e = candidate.end_s; }
+
+  const hardEnd = durationS || Math.max(e, candidate.end_s);
+  if (e - s < minLen) {
+    const mid = (s + e) / 2;
+    s = mid - minLen / 2;
+    e = mid + minLen / 2;
+  }
+  if (e - s > maxLen) e = s + maxLen;
+  if (s < 0) { e += -s; s = 0; }
+  if (e > hardEnd) { s = Math.max(0, s - (e - hardEnd)); e = hardEnd; }
+  return { start: Math.round(s * 100) / 100, end: Math.round(e * 100) / 100 };
+}
+
 async function scoreCandidate(candidate, rubric, gameName) {
   const len = Math.round((candidate.end_s - candidate.start_s) * 10) / 10;
   const prompt = [
@@ -286,8 +324,10 @@ async function processRecording(agentId, rec, cfg) {
   await hub('POST', `/api/clipscan/recordings/${rec.id}/candidates`, { candidates }).catch(() => {});
 
   // 4. Rubric (studied once per game)
-  const meta = await ensureRubric(agentId, rec.app_id, rec.game_name);
-  const rubric = (meta && meta.rubric) || null;
+  const meta = await ensureRubric(agentId, rec.app_id, rec.game_name).catch(() => null);
+  // Never hand the judge a null rubric — every rationale then complains it had
+  // nothing to match against, which is noise rather than a verdict.
+  const rubric = (meta && meta.rubric) || FALLBACK_RUBRIC;
 
   // 5. Score + cut
   await setStatus(agentId, rec.id, 'cutting', { progress: `${candidates.length} candidates` });
@@ -298,11 +338,11 @@ async function processRecording(agentId, rec, cfg) {
     await beat(agentId, `Scoring ${label} (${i + 1}/${candidates.length})`);
     const judged = await scoreCandidate(c, rubric, rec.game_name);
 
-    // Honour the tightened window when it's sane, else keep the detected one.
-    let [s, e] = Array.isArray(judged.recommended_length_s) ? judged.recommended_length_s : [c.start_s, c.end_s];
-    if (!(Number.isFinite(s) && Number.isFinite(e)) || e - s < 1) { s = c.start_s; e = c.end_s; }
-    s = Math.max(0, Math.min(s, c.start_s));
-    e = Math.max(s + 1, Math.min(e, duration || e));
+    const { start: s, end: e } = clampWindow(judged.recommended_length_s, c, cfg.clipLenS, duration);
+    if (e - s < 1) {
+      await note(agentId, 'warning', `[${label}] skipped a moment at ${c.start_s}s — no usable window inside the recording.`, { recording_id: rec.id });
+      continue;
+    }
 
     if (judged.score < cfg.minScore && cfg.lowScore === 'skip') {
       await note(agentId, 'status', `[${label}] skipped a ${judged.score}-scoring moment (below the floor).`, { recording_id: rec.id });
@@ -387,6 +427,9 @@ async function start({ count = parseInt(process.env.CLIPSCAN_AGENT_COUNT || '4',
     await note(null, 'warning', `Clip scanning cannot start: ${pre.problems.join('; ')}`);
     return { running: false, error: pre.problems.join('; ') };
   }
+  // Non-blocking gaps (e.g. no transcriber) go on the board so a degraded run is
+  // obvious from the start rather than inferred from every rationale.
+  for (const w of (pre.warnings || [])) await note(null, 'warning', w);
   running = true;
   loops = [];
   for (let i = 1; i <= count; i++) loops.push(workerLoop(i));
@@ -418,4 +461,5 @@ module.exports = {
   start, stop, status,
   // exported for tests
   attachTranscripts, extractJson, transcribe, processRecording, sanitizeName,
+  clampWindow, FALLBACK_RUBRIC,
 };

@@ -75,10 +75,21 @@ function run(bin, args, { timeoutMs = 10 * 60 * 1000, cwd } = {}) {
 // Reports whether the pipeline can actually run — called at worker startup so a
 // missing tool is a clear message instead of a mystery failure 10 clips in.
 async function preflight() {
-  const out = { ffmpeg: ffmpegBin(), ffprobe: ffprobeBin(), ok: true, problems: [] };
+  const out = { ffmpeg: ffmpegBin(), ffprobe: ffprobeBin(), ok: true, problems: [], warnings: [] };
   for (const [name, bin] of [['ffmpeg', out.ffmpeg], ['ffprobe', out.ffprobe]]) {
     const r = await run(bin, ['-version'], { timeoutMs: 8000 });
     if (r.code !== 0) { out.ok = false; out.problems.push(`${name} not runnable (tried "${bin}")`); }
+  }
+  // Transcription is a WARNING, not a blocker: without it the pipeline still
+  // finds moments by audio energy, it just can't tell you what was said — and
+  // every score then reads "no speech in the window", which looks like a bug
+  // rather than a missing dependency. Surface it explicitly.
+  const py = process.env.PYTHON_BIN || 'python';
+  const probe = await run(py, ['-c', 'import faster_whisper; print("ok")'], { timeoutMs: 30000 });
+  out.python = py;
+  out.whisper = probe.code === 0 && /ok/.test(probe.stdout);
+  if (!out.whisper) {
+    out.warnings.push(`faster-whisper not importable via "${py}" — clips will be scored without transcripts. Fix: ${py} -m pip install faster-whisper`);
   }
   return out;
 }
@@ -312,20 +323,43 @@ function round2(n) { return Math.round(n * 100) / 100; }
 // Cut a candidate into its own file. Tries stream-copy first (fast) and falls
 // back to a re-encode when keyframe alignment makes the copy imprecise —
 // an empty or badly-truncated output is the tell.
-async function cutClip(source, start, end, outPath, { ffmpeg = ffmpegBin(), forceEncode = false } = {}) {
+// Cut a candidate into its own file that a BROWSER can actually play.
+//
+// Two things are non-negotiable here and both were learned the hard way:
+//
+//   • -movflags +faststart — puts the moov atom at the FRONT of the file. Without
+//     it a progressive <video> download can't start playing until it has the
+//     whole file, which reads as "the clip is broken".
+//   • re-encode by default — a stream copy can only cut on a keyframe, so the
+//     output often begins mid-GOP. The player shows one decoded frame and then
+//     stalls, which also reads as "broken". These clips are 7-30s, so encoding
+//     them is cheap and guarantees a keyframe at frame 0.
+//
+// Set CLIPSCAN_FAST_CUT=1 to prefer the copy path anyway (faster, riskier).
+async function cutClip(source, start, end, outPath, { ffmpeg = ffmpegBin(), forceEncode = false, allowCopy = process.env.CLIPSCAN_FAST_CUT === '1' } = {}) {
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   const dur = Math.max(0.1, end - start);
-  if (!forceEncode) {
-    const r = await run(ffmpeg, ['-y', '-ss', String(start), '-i', source, '-t', String(dur), '-c', 'copy', outPath]);
+
+  if (allowCopy && !forceEncode) {
+    const r = await run(ffmpeg, ['-y', '-ss', String(start), '-i', source, '-t', String(dur),
+      '-c', 'copy', '-movflags', '+faststart', outPath]);
     if (r.code === 0 && fs.existsSync(outPath)) {
       const got = await probeDuration(outPath);
-      // Accept the copy only if it's close to what we asked for.
       if (got != null && got >= dur * 0.6) return { ok: true, mode: 'copy', duration: got };
     }
   }
+
+  // Accurate seek: -ss before -i for speed, then -ss 0 semantics are handled by
+  // ffmpeg's decode-and-discard, so the first output frame is a real keyframe.
   const r2 = await run(ffmpeg, ['-y', '-ss', String(start), '-i', source, '-t', String(dur),
-    '-c:v', 'libx264', '-crf', '18', '-preset', 'veryfast', '-c:a', 'aac', outPath]);
-  if (r2.code === 0 && fs.existsSync(outPath)) return { ok: true, mode: 'encode', duration: await probeDuration(outPath) };
+    '-c:v', 'libx264', '-crf', '20', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', outPath]);
+  if (r2.code === 0 && fs.existsSync(outPath)) {
+    const got = await probeDuration(outPath);
+    // A file that exists but has no measurable duration is broken, not a success.
+    if (got == null || got < 0.5) return { ok: false, error: `output has no usable duration (${got})` };
+    return { ok: true, mode: 'encode', duration: got };
+  }
   return { ok: false, error: tail(r2.stderr) };
 }
 

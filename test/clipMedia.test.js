@@ -183,6 +183,59 @@ test('JSON is recovered from a model reply even when it is fenced or chatty', ()
   assert.strictEqual(worker.extractJson('no json here'), null, 'gives up cleanly');
 });
 
+// ── The judge's suggested window is clamped back to something postable ───────
+// Regression: a real run emitted a 3s clip because the judge's
+// recommended_length_s was trusted verbatim, below the 7s configured minimum.
+test('a too-short suggested window is grown to the minimum around its midpoint', () => {
+  const c = { start_s: 100, end_s: 118 };
+  const w = worker.clampWindow([110, 113], c, [7, 30], 600);
+  assert.ok(w.end - w.start >= 7, `grown to the minimum (got ${w.end - w.start}s)`);
+  assert.ok(w.start < 111.5 && w.end > 111.5, 'grown around the middle of what the judge picked');
+});
+
+test('a too-long suggested window is capped at the maximum', () => {
+  const w = worker.clampWindow([10, 90], { start_s: 10, end_s: 40 }, [7, 30], 600);
+  assert.strictEqual(w.end - w.start, 30, 'capped at the configured maximum');
+});
+
+test('a sensible suggested window is left alone', () => {
+  const w = worker.clampWindow([120.5, 134], { start_s: 118, end_s: 140 }, [7, 30], 600);
+  assert.strictEqual(w.start, 120.5);
+  assert.strictEqual(w.end, 134);
+});
+
+test('a garbage suggestion falls back to the detected candidate', () => {
+  const c = { start_s: 50, end_s: 62 };
+  for (const bad of [null, undefined, [], ['x', 'y'], [30, 10], [5]]) {
+    const w = worker.clampWindow(bad, c, [7, 30], 600);
+    assert.strictEqual(w.start, 50, `fell back for ${JSON.stringify(bad)}`);
+    assert.strictEqual(w.end, 62);
+  }
+});
+
+test('the window is kept inside the recording without collapsing', () => {
+  // Near the end: growing to the minimum must shift the start back, not run past.
+  const w = worker.clampWindow([297, 299], { start_s: 295, end_s: 300 }, [7, 30], 300);
+  assert.ok(w.end <= 300, 'never past the end of the recording');
+  assert.ok(w.start >= 0, 'never negative');
+  assert.ok(w.end - w.start >= 7, 'still grown to a postable length by shifting the start back');
+  // Near the start: the same in the other direction.
+  const w2 = worker.clampWindow([1, 3], { start_s: 0, end_s: 5 }, [7, 30], 300);
+  assert.strictEqual(w2.start, 0, 'clamped to the beginning');
+  assert.ok(w2.end - w2.start >= 7, 'and grown forwards instead');
+});
+
+test('a recording shorter than the minimum yields what exists, not a negative window', () => {
+  const w = worker.clampWindow([1, 3], { start_s: 0, end_s: 4 }, [7, 30], 4);
+  assert.ok(w.start >= 0 && w.end <= 4, 'stays inside a 4s recording');
+  assert.ok(w.end > w.start, 'still a real window');
+});
+
+test('there is always a rubric to judge against', () => {
+  assert.ok(worker.FALLBACK_RUBRIC.winning_patterns.length, 'the fallback has real content');
+  assert.strictEqual(worker.FALLBACK_RUBRIC._fallback, true, 'and is flagged so a degraded run is visible');
+});
+
 test('game names are made safe for a Windows folder path', () => {
   assert.strictEqual(worker.sanitizeName('MECCHA CHAMELEON'), 'MECCHA CHAMELEON', 'ordinary names survive');
   assert.strictEqual(worker.sanitizeName('Half-Life: Alyx?'), 'Half-Life Alyx', 'illegal characters removed');
