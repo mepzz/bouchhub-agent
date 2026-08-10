@@ -66,7 +66,15 @@ async function setStatus(agentId, recId, status, extra = {}) {
 // stretches; pass null to do the WHOLE recording, which is what the pipeline
 // does now — transcribing slivers around audio spikes meant the picker never
 // knew what was actually said and chose loud noises over moments.
-function transcribe(wav, windows, { pythonBin = process.env.PYTHON_BIN || 'python', timeoutMs = 20 * 60 * 1000 } = {}) {
+// Uses whichever interpreter clipMedia found that can actually import
+// faster_whisper — NOT a bare "python", which under the SYSTEM account the agent
+// runs as usually resolves to nothing (or to an install without the package).
+async function transcribe(wav, windows, opts = {}) {
+  const pythonBin = opts.pythonBin || (await media.findPython('faster_whisper')).bin;
+  return transcribeWith(pythonBin, wav, windows, opts);
+}
+
+function transcribeWith(pythonBin, wav, windows, { timeoutMs = 20 * 60 * 1000 } = {}) {
   return new Promise((resolve) => {
     const args = [path.join(__dirname, 'scripts', 'clip_transcribe.py'), wav];
     if (windows && windows.length) args.push('--windows', JSON.stringify(windows));

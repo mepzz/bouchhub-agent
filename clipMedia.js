@@ -62,6 +62,58 @@ let _ffmpeg = null, _ffprobe = null;
 function ffmpegBin() { return _ffmpeg || (_ffmpeg = findTool('ffmpeg')); }
 function ffprobeBin() { return _ffprobe || (_ffprobe = findTool('ffprobe')); }
 
+// ── Python discovery ─────────────────────────────────────────────────────────
+// The agent runs as SYSTEM. `pip install` run from a normal PowerShell window
+// installs into THAT user's site-packages, which SYSTEM cannot see — and SYSTEM's
+// PATH often has no `python` at all. So "faster-whisper isn't installed" is
+// usually "it's installed, for a different account".
+//
+// Rather than assume one interpreter, enumerate the plausible ones and pick the
+// first that can actually import the package.
+function pythonCandidates() {
+  const out = [];
+  const add = p => { if (p && !out.includes(p)) out.push(p); };
+  add(process.env.PYTHON_BIN);
+  add('python'); add('python3');
+  if (process.platform === 'win32') {
+    // Per-user installs (the usual case) live under each user's profile, and
+    // SYSTEM's homedir is NOT the logged-in user's — so scan C:\Users directly.
+    try {
+      for (const user of fs.readdirSync('C:\\Users')) {
+        const base = path.join('C:\\Users', user, 'AppData', 'Local', 'Programs', 'Python');
+        try {
+          for (const v of fs.readdirSync(base)) add(path.join(base, v, 'python.exe'));
+        } catch (_) {}
+      }
+    } catch (_) {}
+    // Machine-wide installs.
+    for (const root of ['C:\\', 'C:\\Program Files\\']) {
+      try {
+        for (const d of fs.readdirSync(root)) {
+          if (/^python\d/i.test(d)) add(path.join(root, d, 'python.exe'));
+        }
+      } catch (_) {}
+    }
+  }
+  return out;
+}
+
+let _python = null;
+// Returns { bin, ok, tried } — the first interpreter that can import `mod`.
+async function findPython(mod = 'faster_whisper') {
+  if (_python && _python.ok) return _python;
+  const tried = [];
+  for (const bin of pythonCandidates()) {
+    const r = await run(bin, ['-c', `import ${mod}; print("ok")`], { timeoutMs: 45000 });
+    const ok = r.code === 0 && /ok/.test(r.stdout);
+    tried.push({ bin, ok, why: ok ? null : tail(r.stderr || 'not runnable', 120) });
+    if (ok) { _python = { bin, ok: true, tried }; return _python; }
+  }
+  _python = { bin: process.env.PYTHON_BIN || 'python', ok: false, tried };
+  return _python;
+}
+function pythonBin() { return (_python && _python.ok) ? _python.bin : (process.env.PYTHON_BIN || 'python'); }
+
 function run(bin, args, { timeoutMs = 10 * 60 * 1000, cwd } = {}) {
   return new Promise((resolve) => {
     execFile(bin, args, { cwd, timeout: timeoutMs, windowsHide: true, maxBuffer: 64 * 1024 * 1024 },
@@ -84,12 +136,23 @@ async function preflight() {
   // finds moments by audio energy, it just can't tell you what was said — and
   // every score then reads "no speech in the window", which looks like a bug
   // rather than a missing dependency. Surface it explicitly.
-  const py = process.env.PYTHON_BIN || 'python';
-  const probe = await run(py, ['-c', 'import faster_whisper; print("ok")'], { timeoutMs: 30000 });
-  out.python = py;
-  out.whisper = probe.code === 0 && /ok/.test(probe.stdout);
+  const py = await findPython('faster_whisper');
+  out.python = py.bin;
+  out.whisper = py.ok;
+  out.pythonTried = py.tried;
   if (!out.whisper) {
-    out.warnings.push(`faster-whisper not importable via "${py}" — clips will be scored without transcripts. Fix: ${py} -m pip install faster-whisper`);
+    // Name every interpreter that was tried. "Not installed" is almost always
+    // "installed for your user, not for the SYSTEM account the agent runs as",
+    // and without the list that is impossible to tell apart from a real absence.
+    const list = py.tried.length
+      ? py.tried.map(t => `${t.bin} (${t.why})`).join('; ')
+      : 'no python interpreter found at all';
+    out.warnings.push(
+      `faster-whisper could not be imported by any Python this agent can see, so clips will be picked from audio energy only, ` +
+      `with no transcript. Tried: ${list}. ` +
+      `NOTE: the agent runs as SYSTEM, so a "pip install" from your own PowerShell window installs somewhere it cannot reach. ` +
+      `Fix by installing for all users (an elevated: "<python> -m pip install faster-whisper") or by setting PYTHON_BIN in the agent's .env ` +
+      `to the full path of a python.exe that already has it.`);
   }
   return out;
 }
@@ -565,7 +628,7 @@ async function thumbnail(video, outPath, { ffmpeg = ffmpegBin(), atS = null } = 
 }
 
 module.exports = {
-  findTool, ffmpegBin, ffprobeBin, preflight, run,
+  findTool, ffmpegBin, ffprobeBin, findPython, pythonBin, pythonCandidates, preflight, run,
   inspectFolder, orderSegments, groupStreams, reconstruct,
   probeDuration, probeMedia, assessRebuild, extractAudio, loudnessTrack, findPeaks, mergeOverlaps,
   silenceGaps, snapToSilence,
