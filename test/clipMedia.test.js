@@ -368,5 +368,27 @@ async function atest(name, fn) {
     assert.strictEqual(await worker.serialise(async () => 'ok'), 'ok');
   });
 
+  await atest('an empty provider reply is retried once before giving up', async () => {
+    process.env.CLIPSCAN_RETRY_MS = '1';
+    const claude = require('../claude');
+    const real = claude.complete;
+    try {
+      let calls = 0;
+      claude.complete = async () => (++calls === 1 ? { text: '' } : { text: '{"score":42}' });
+      const r = await worker.ask('score this');
+      assert.strictEqual(calls, 2, 'the transient empty reply was retried');
+      assert.strictEqual(r.text, '{"score":42}', 'and the retry\'s answer is used');
+
+      calls = 0;
+      claude.complete = async () => { calls++; return { text: '' }; };
+      const dead = await worker.ask('score this');
+      assert.strictEqual(calls, 2, 'it gives up after one retry rather than looping');
+      assert.ok(/retried once/.test(dead.error), 'and says so, instead of a bare "unjudged"');
+    } finally {
+      claude.complete = real;
+      delete process.env.CLIPSCAN_RETRY_MS;
+    }
+  });
+
   console.log(`\n${passed} passed`);
 })().catch((e) => { console.error(e); process.exit(1); });

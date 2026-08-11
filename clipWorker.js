@@ -133,8 +133,18 @@ function serialise(fn) {
   return run;
 }
 
+// Serialising covers the clip-scan workers, but not a mascot session holding
+// ~/.claude at the same moment — that collision looks identical (exit 0, no
+// output) and is transient, so an empty reply is retried once before giving up.
+const RETRY_DELAY_MS = Number(process.env.CLIPSCAN_RETRY_MS || 8000);
+
 async function ask(prompt, { provider = process.env.CLIPSCAN_PROVIDER || 'claude', timeoutMs = 180000 } = {}) {
-  return serialise(() => askNow(prompt, { provider, timeoutMs }));
+  const first = await serialise(() => askNow(prompt, { provider, timeoutMs }));
+  if (first.text) return first;
+  await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+  const second = await serialise(() => askNow(prompt, { provider, timeoutMs }));
+  if (second.text) return second;
+  return { text: '', error: `${second.error} (retried once)` };
 }
 
 async function askNow(prompt, { provider, timeoutMs }) {
@@ -687,5 +697,5 @@ module.exports = {
   start, stop, status, resume,
   // exported for tests
   attachTranscripts, extractJson, transcribe, processRecording, sanitizeName,
-  clampWindow, FALLBACK_RUBRIC, buildTimeline, selectMoments, fmtTs, serialise,
+  clampWindow, FALLBACK_RUBRIC, buildTimeline, selectMoments, fmtTs, serialise, ask,
 };
