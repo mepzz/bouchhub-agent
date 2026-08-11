@@ -25,6 +25,9 @@ const HEARTBEAT_MS = 15 * 1000;
 let running = false;
 let loops = [];
 const state = {};                    // workerId → { status, task }
+// Why the last provider call failed, so the worker can say so on the board
+// instead of leaving every cut marked "unjudged" with no explanation.
+let lastAskProblem = null;
 
 // ── Hub conversation ─────────────────────────────────────────────────────────
 async function hub(method, endpoint, body, { timeoutMs = 60000 } = {}) {
@@ -113,10 +116,20 @@ function attachTranscripts(candidates, segments) {
 // Scoring and rubric-writing both go through the provider runner, so they use
 // the logged-in subscription (never metered credits — providerEnv blanks the
 // API key for the claude family).
+// Returns { text, error }. NEVER swallow the reason: when the provider is rate
+// limited or its CLI fails, every cut silently came back "unjudged — review
+// manually" with no way to tell a usage limit from a broken install.
 async function ask(prompt, { provider = process.env.CLIPSCAN_PROVIDER || 'claude', timeoutMs = 180000 } = {}) {
   const claude = require('./claude');
-  const r = await claude.complete({ provider, prompt, timeoutMs });
-  return (r && (r.text || r.output || r.stdout)) || '';
+  try {
+    const r = await claude.complete({ provider, prompt, timeoutMs });
+    const text = (r && (r.text || r.output || r.stdout)) || '';
+    if (text) return { text, error: null };
+    const why = (r && (r.error || r.stderr)) || 'no output';
+    return { text: '', error: `provider "${provider}" returned nothing (${String(why).slice(-200)})` };
+  } catch (e) {
+    return { text: '', error: `provider "${provider}" failed: ${e.message}` };
+  }
 }
 
 // Models sometimes wrap JSON in prose or a fence — take the first balanced object.
@@ -188,7 +201,9 @@ async function ensureRubric(agentId, appId, gameName) {
     `Be concrete and specific to THIS game's moment-to-moment action, not generic advice.`,
   ].join('\n');
 
-  const rubric = extractJson(await ask(prompt).catch(() => '')) || FALLBACK_RUBRIC;
+  const askedRubric = await ask(prompt);
+  if (!askedRubric.text) lastAskProblem = askedRubric.error;
+  const rubric = extractJson(askedRubric.text) || FALLBACK_RUBRIC;
   if (rubric._fallback) {
     await note(agentId, 'warning', `Could not study ${gameName || appId} virals — using a generic rubric. Scores will be less game-specific.`);
   }
@@ -285,7 +300,9 @@ async function selectMoments(timeline, rubric, gameName, durationS, clipLenS) {
     `start_s/end_s are absolute seconds from the beginning of the recording. Do not exceed ${Math.round(durationS || 0)}s.`,
   ].join('\n');
 
-  const j = extractJson(await ask(prompt).catch(() => ''));
+  const a = await ask(prompt);
+  const j = extractJson(a.text);
+  if (!j) lastAskProblem = a.error || `the picker replied but not with JSON: ${String(a.text).slice(0, 200)}`;
   const list = (j && Array.isArray(j.moments)) ? j.moments : [];
   return list
     .map(m => ({
@@ -341,14 +358,17 @@ async function scoreCandidate(candidate, rubric, gameName) {
     `{"score":0-100,"rationale":"what happens and why it does or doesn't work","goods":["..."],"bads":["..."]}`,
   ].filter(Boolean).join('\n');
 
-  const j = extractJson(await ask(prompt).catch(() => ''));
+  const a = await ask(prompt);
+  const j = extractJson(a.text);
   if (!j || typeof j.score !== 'number') {
+    lastAskProblem = a.error || `the judge replied but not with JSON: ${String(a.text).slice(0, 200)}`;
     // Never drop a moment because the judge misbehaved — the picker already
     // decided this was worth cutting, so keep it and flag it for manual review.
     return {
       score: candidate.audio_score != null ? Math.round(candidate.audio_score * 55) : 45,
       rationale: candidate.why || 'The judgment step did not return usable JSON — review this one manually.',
-      goods: [], bads: ['unjudged — review manually'],
+      goods: [], bads: [`unjudged (${a.error ? 'provider error' : 'bad reply'}) — review manually`],
+      _error: lastAskProblem,
     };
   }
   return j;
@@ -467,10 +487,12 @@ async function processRecording(agentId, rec, cfg) {
   await setStatus(agentId, rec.id, 'cutting', { progress: `${candidates.length} moments` });
   const gameDir = path.join(cfg.outDir, sanitizeName(rec.game_name || rec.app_id), (rec.recorded_at || '').slice(0, 10) || 'undated');
   let made = 0;
+  let unjudged = 0;
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i];
     await beat(agentId, `Scoring ${label} (${i + 1}/${candidates.length})`);
     const judged = await scoreCandidate(c, rubric, rec.game_name);
+    if (judged._error) unjudged++;
 
     // The window is already chosen, length-clamped and snapped to conversation
     // breaks. The judge scores it — it does NOT get to re-cut it, which is what
@@ -537,6 +559,16 @@ async function processRecording(agentId, rec, cfg) {
 
   await setStatus(agentId, rec.id, 'done', { progress: `${made} cut(s)` });
   await note(agentId, 'finding', `[${label}] done — ${made} cut(s) from ${candidates.length} candidate(s).`, { recording_id: rec.id });
+
+  // If the provider failed, SAY SO. Otherwise every cut just reads "unjudged —
+  // review manually" and a usage limit is indistinguishable from a broken CLI.
+  if (unjudged) {
+    await note(agentId, 'warning',
+      `[${label}] ${unjudged} of ${candidates.length} moment(s) could not be scored. Reason: ${lastAskProblem || 'unknown'}. ` +
+      `The clips were still cut — only the score and rationale are missing. If this is a usage limit, they can be re-scored later; ` +
+      `set CLIPSCAN_PROVIDER to another agent (codex/gemini) to score with a different one.`,
+      { recording_id: rec.id });
+  }
 }
 
 function sanitizeName(s) { return String(s || 'unknown').replace(/[<>:"/\\|?*]/g, '').trim() || 'unknown'; }
