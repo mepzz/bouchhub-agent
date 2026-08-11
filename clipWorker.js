@@ -484,8 +484,15 @@ async function processRecording(agentId, rec, cfg) {
   const audio = await media.extractAudio(mp4, wav);
   if (!audio.ok) {
     await setStatus(agentId, rec.id, 'error', { error_msg: `audio extraction failed: ${audio.stderr}` });
-    await note(agentId, 'warning', `[${label}] audio extraction failed.`, { recording_id: rec.id });
+    // Say what was tried, not just that it failed — "audio extraction failed"
+    // on its own sent us digging through raw ffmpeg logs to learn anything.
+    await note(agentId, 'warning', `[${label}] audio extraction failed — ${audio.stderr}`, { recording_id: rec.id });
     return;
+  }
+  if (audio.partial) {
+    await note(agentId, 'warning',
+      `[${label}] the recorded audio is damaged; recovered ${Math.round(audio.durationS)}s of ${Math.round(duration)}s via ${audio.how}. ` +
+      `Moments after that point won't be found.`, { recording_id: rec.id });
   }
 
   const track = await media.loudnessTrack(wav);

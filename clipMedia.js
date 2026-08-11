@@ -396,10 +396,68 @@ function assessRebuild(probe, { minPlausibleS = 20 } = {}) {
   return { ok: problems.length === 0, problems };
 }
 
-async function extractAudio(video, wavOut, { ffmpeg = ffmpegBin() } = {}) {
+// Steam's recorded AAC is not always clean once the DASH fragments are joined:
+// "invalid band type", "Number of bands (31) exceeds limit (27)", and a program
+// config element whose sample rate index disagrees with the container. ffmpeg
+// decodes happily until its error rate crosses a threshold, then throws away a
+// perfectly good partial file and reports "Conversion failed!".
+//
+// So: try clean, then tolerant, then route around the container entirely — and
+// accept a partial track, because 40 usable minutes beats no recording at all.
+const AUDIO_ATTEMPTS = [
+  { how: 'clean', pre: [], post: [] },
+  {
+    // Skip corrupt packets and never abort over the decode error rate.
+    how: 'error-tolerant',
+    pre: ['-err_detect', 'ignore_err', '-fflags', '+discardcorrupt', '-analyzeduration', '100M', '-probesize', '100M'],
+    post: ['-max_error_rate', '1'],
+  },
+];
+
+// `exec`/`probe` are injectable for the same reason `ffmpeg` is: so the escalation
+// order can be tested without a working ffmpeg and a damaged recording to hand.
+async function extractAudio(video, wavOut, { ffmpeg = ffmpegBin(), minUsableS = 30, exec = run, probe = probeDuration } = {}) {
   fs.mkdirSync(path.dirname(wavOut), { recursive: true });
-  const r = await run(ffmpeg, ['-y', '-i', video, '-vn', '-ac', '1', '-ar', '16000', wavOut]);
-  return { ok: r.code === 0 && fs.existsSync(wavOut), stderr: tail(r.stderr) };
+  const out = ['-vn', '-ac', '1', '-ar', '16000'];
+  const tried = [];
+  const usableWav = async () => {
+    if (!fs.existsSync(wavOut) || fs.statSync(wavOut).size === 0) return { ok: false, durationS: 0 };
+    const durationS = (await probe(wavOut)) || 0;
+    return { ok: durationS >= minUsableS, durationS };
+  };
+
+  for (const a of AUDIO_ATTEMPTS) {
+    const r = await exec(ffmpeg, ['-y', ...a.pre, '-i', video, ...out, ...a.post, wavOut], { timeoutMs: 30 * 60 * 1000 });
+    const got = await usableWav();
+    if (r.code === 0 && got.ok) return { ok: true, how: a.how, durationS: got.durationS, stderr: tail(r.stderr) };
+    // ffmpeg failed, but did it leave enough behind to work with?
+    if (got.ok) return { ok: true, how: `${a.how} (partial)`, partial: true, durationS: got.durationS, stderr: tail(r.stderr) };
+    tried.push(`${a.how}: ${got.durationS ? `only ${Math.round(got.durationS)}s` : 'nothing usable'}`);
+  }
+
+  // Last resort: copy the AAC out to ADTS and decode THAT. Every ADTS frame
+  // carries its own sample rate index, so the container's disagreeing program
+  // config element — the specific complaint in the log — stops mattering.
+  const adts = wavOut.replace(/\.wav$/i, '') + '.aac';
+  try {
+    const c = await exec(ffmpeg, ['-y', '-err_detect', 'ignore_err', '-fflags', '+discardcorrupt',
+      '-i', video, '-vn', '-c:a', 'copy', '-max_error_rate', '1', adts], { timeoutMs: 30 * 60 * 1000 });
+    if (c.code === 0 || (fs.existsSync(adts) && fs.statSync(adts).size > 0)) {
+      const d = await exec(ffmpeg, ['-y', '-err_detect', 'ignore_err', '-fflags', '+discardcorrupt',
+        '-i', adts, ...out, '-max_error_rate', '1', wavOut], { timeoutMs: 30 * 60 * 1000 });
+      const got = await usableWav();
+      if (got.ok) {
+        return { ok: true, how: `raw-aac-relay${d.code === 0 ? '' : ' (partial)'}`, partial: d.code !== 0, durationS: got.durationS, stderr: tail(d.stderr) };
+      }
+      tried.push(`raw-aac-relay: ${got.durationS ? `only ${Math.round(got.durationS)}s` : 'nothing usable'}`);
+    } else {
+      tried.push(`raw-aac-relay: could not copy the audio out (${tail(c.stderr, 120)})`);
+    }
+  } catch (e) {
+    tried.push(`raw-aac-relay: ${e.message}`);
+  } finally { try { fs.unlinkSync(adts); } catch (_) {} }
+
+  return { ok: false, how: null, stderr: `tried ${tried.join(' | ')}` };
 }
 
 // ── Audio-first detection ────────────────────────────────────────────────────

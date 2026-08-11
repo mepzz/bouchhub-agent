@@ -456,6 +456,47 @@ async function atest(name, fn) {
     assert.ok(short.length && short.every(x => x >= 0 && x <= 1), 'a one-second window still produces valid times');
   });
 
+  await atest('damaged audio is recovered rather than abandoned', async () => {
+    // Steam's joined AAC makes ffmpeg abort with "Conversion failed!" AFTER it
+    // has already written minutes of good audio. Losing the whole recording over
+    // that is the bug; the partial track is the recording.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clipaudio-'));
+    const wav = path.join(dir, 'audio.wav');
+    const calls = [];
+    try {
+      // Attempt 1 (clean) writes 249s of audio then dies, exactly like the log.
+      const exec = async (_bin, args) => {
+        calls.push(args.join(' '));
+        fs.writeFileSync(wav, 'x');
+        return { code: 1, stderr: 'Conversion failed!' };
+      };
+      const r = await media.extractAudio('in.mp4', wav, { ffmpeg: 'ffmpeg', exec, probe: async () => 249.6 });
+      assert.strictEqual(r.ok, true, 'the partial track is accepted');
+      assert.strictEqual(r.partial, true, 'and it is flagged as partial, not passed off as complete');
+      assert.ok(/clean/.test(r.how), `it reports which route worked, got ${r.how}`);
+      assert.strictEqual(Math.round(r.durationS), 250, 'and says how much was recovered');
+      assert.strictEqual(calls.length, 1, 'no pointless retry once there is usable audio');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await atest('audio with nothing usable escalates through every route, then explains', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clipaudio-'));
+    const wav = path.join(dir, 'audio.wav');
+    const seen = [];
+    try {
+      const exec = async (_bin, args) => { seen.push(args.join(' ')); return { code: 1, stderr: 'invalid band type' }; };
+      const r = await media.extractAudio('in.mp4', wav, { ffmpeg: 'ffmpeg', exec, probe: async () => 0 });
+      assert.strictEqual(r.ok, false);
+      assert.ok(seen.some(a => /discardcorrupt/.test(a)), 'it tried the tolerant decode');
+      assert.ok(seen.some(a => /-c:a copy/.test(a)), 'and the raw-AAC route that sidesteps the container');
+      assert.ok(/clean.*error-tolerant/s.test(r.stderr), `the report names what was tried, got: ${r.stderr}`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   await atest('a failed look at the frames falls back to scoring, not to "unjudged"', async () => {
     const claude = require('../claude');
     const real = claude.complete;
