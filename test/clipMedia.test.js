@@ -337,4 +337,36 @@ test('game names are made safe for a Windows folder path', () => {
   assert.strictEqual(worker.sanitizeName(''), 'unknown', 'empty falls back');
 });
 
-console.log(`\n${passed} passed`);
+// The sync harness above can't await, and the queue below is the whole point of
+// the fix, so it gets its own async runner rather than a fake synchronous check.
+async function atest(name, fn) {
+  try { await fn(); console.log(`  ✓ ${name}`); passed++; }
+  catch (e) { console.log(`  ✗ ${name}`); throw e; }
+}
+
+(async () => {
+  await atest('model calls are taken one at a time, never concurrently', async () => {
+    // Four workers hitting one shared ~/.claude raced each other: the CLI exited
+    // 0 with empty output and every moment came back "unjudged".
+    let inFlight = 0, maxInFlight = 0;
+    const done = [];
+    // Descending delays: if these ran concurrently they would finish 3,2,1.
+    const job = (n) => worker.serialise(async () => {
+      inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 30 - n * 8));
+      inFlight--; done.push(n);
+      return n;
+    });
+    const results = await Promise.all([job(1), job(2), job(3)]);
+    assert.strictEqual(maxInFlight, 1, 'only one provider call is ever in flight');
+    assert.deepStrictEqual(done, [1, 2, 3], 'they run in the order they were queued');
+    assert.deepStrictEqual(results, [1, 2, 3], 'each caller gets its own result back');
+  });
+
+  await atest('one failed call does not wedge the queue behind it', async () => {
+    await worker.serialise(async () => { throw new Error('provider died'); }).catch(() => {});
+    assert.strictEqual(await worker.serialise(async () => 'ok'), 'ok');
+  });
+
+  console.log(`\n${passed} passed`);
+})().catch((e) => { console.error(e); process.exit(1); });

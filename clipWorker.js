@@ -119,7 +119,25 @@ function attachTranscripts(candidates, segments) {
 // Returns { text, error }. NEVER swallow the reason: when the provider is rate
 // limited or its CLI fails, every cut silently came back "unjudged — review
 // manually" with no way to tell a usage limit from a broken install.
+// Model calls are SERIALISED across all workers on this machine.
+//
+// claude.js warns that concurrent sessions need separate config dirs — a shared
+// ~/.claude races on .claude.json and credentials. All four clip-scan workers
+// were calling the same provider at once, so the CLI exited 0 with no output and
+// every moment came back unscored. Scoring is not the bottleneck here (ffmpeg
+// and transcription are), so taking these one at a time costs almost nothing.
+let _askChain = Promise.resolve();
+function serialise(fn) {
+  const run = _askChain.then(fn, fn);
+  _askChain = run.catch(() => {});
+  return run;
+}
+
 async function ask(prompt, { provider = process.env.CLIPSCAN_PROVIDER || 'claude', timeoutMs = 180000 } = {}) {
+  return serialise(() => askNow(prompt, { provider, timeoutMs }));
+}
+
+async function askNow(prompt, { provider, timeoutMs }) {
   const claude = require('./claude');
   try {
     const r = await claude.complete({ provider, prompt, timeoutMs });
@@ -669,5 +687,5 @@ module.exports = {
   start, stop, status, resume,
   // exported for tests
   attachTranscripts, extractJson, transcribe, processRecording, sanitizeName,
-  clampWindow, FALLBACK_RUBRIC, buildTimeline, selectMoments, fmtTs,
+  clampWindow, FALLBACK_RUBRIC, buildTimeline, selectMoments, fmtTs, serialise,
 };
