@@ -650,7 +650,46 @@ async function thumbnail(video, outPath, { ffmpeg = ffmpegBin(), atS = null } = 
   return r.code === 0 && fs.existsSync(outPath);
 }
 
+// Where to sample a window so the judge can actually SEE it. Every rationale
+// this pipeline produced complained it was "picked entirely from audio" and
+// could not confirm a tongue latch or a camo flicker — because it was scoring
+// text. Two of these times are load-bearing rather than decorative: the rubric
+// keeps asking what is on screen in the first ~1.5s (a cold open on a standing
+// character is stated to be dead on arrival), and where the payoff lands.
+// Pure so the spacing is testable without ffmpeg.
+function frameTimes(startS, endS, n = 6) {
+  const len = Math.max(0, endS - startS);
+  if (!len) return [];
+  if (n <= 1) return [round2(startS + len / 2)];
+  const times = [round2(startS + Math.min(0.8, len / 8))]; // the opening hook
+  const rest = n - 1;
+  for (let i = 1; i <= rest; i++) times.push(round2(startS + (len * i) / rest));
+  // Never sample past the end — the last frame of a cut is often black.
+  return [...new Set(times.map(t => Math.min(t, round2(endS - 0.15))))].filter(t => t >= startS);
+}
+
+// Pull those frames out as small JPEGs. Downscaled hard: the judge needs to see
+// what is happening, not read the HUD, and 3840-wide stills would be absurd to
+// hand to a model. Best-effort — scoring must still work when this fails.
+async function extractFrames(video, startS, endS, outDir, { ffmpeg = ffmpegBin(), count = 6, width = 640 } = {}) {
+  const times = frameTimes(startS, endS, count);
+  if (!times.length) return [];
+  fs.mkdirSync(outDir, { recursive: true });
+  const made = [];
+  for (let i = 0; i < times.length; i++) {
+    const out = path.join(outDir, `frame${String(i + 1).padStart(2, '0')}_${Math.round(times[i])}s.jpg`);
+    // -ss before -i seeks by keyframe: fast, and precise enough for a still.
+    const r = await run(ffmpeg, [
+      '-y', '-ss', String(times[i]), '-i', video, '-frames:v', '1',
+      '-vf', `scale=${width}:-2`, '-q:v', '4', out,
+    ], { timeoutMs: 60000 });
+    if (r.code === 0 && fs.existsSync(out) && fs.statSync(out).size > 0) made.push({ path: out, atS: times[i] });
+  }
+  return made;
+}
+
 module.exports = {
+  frameTimes, extractFrames,
   findTool, ffmpegBin, ffprobeBin, findPython, pythonBin, pythonCandidates, preflight, run,
   inspectFolder, orderSegments, groupStreams, reconstruct,
   probeDuration, probeMedia, assessRebuild, extractAudio, loudnessTrack, findPeaks, mergeOverlaps,

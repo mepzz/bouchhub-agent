@@ -437,5 +437,47 @@ async function atest(name, fn) {
     }
   });
 
+  await atest('frame sampling opens on the hook and never runs past the end', () => {
+    // Every rationale the judge produced complained it could not confirm what
+    // was on screen in the first ~1.5s, so the first sample is deliberately early.
+    const t = media.frameTimes(100, 140, 6);
+    assert.strictEqual(t.length, 6, 'six samples across the window');
+    assert.ok(t[0] >= 100 && t[0] <= 101.5, `first frame is in the opening hook, got ${t[0]}`);
+    assert.ok(t.every(x => x >= 100 && x <= 140), 'every sample lies inside the window');
+    assert.ok(t[t.length - 1] < 140, 'the last sample stops short of the end, which is often black');
+    assert.deepStrictEqual([...t].sort((a, b) => a - b), t, 'samples are in order');
+  });
+
+  await atest('frame sampling copes with degenerate windows', () => {
+    assert.deepStrictEqual(media.frameTimes(10, 10, 6), [], 'a zero-length window yields nothing');
+    assert.deepStrictEqual(media.frameTimes(5, 3, 6), [], 'a backwards window yields nothing');
+    assert.strictEqual(media.frameTimes(0, 20, 1).length, 1, 'a single sample is the midpoint');
+    const short = media.frameTimes(0, 1, 6);
+    assert.ok(short.length && short.every(x => x >= 0 && x <= 1), 'a one-second window still produces valid times');
+  });
+
+  await atest('a failed look at the frames falls back to scoring, not to "unjudged"', async () => {
+    const claude = require('../claude');
+    const real = claude.complete;
+    try {
+      const seen = [];
+      claude.complete = async ({ prompt, allowTools }) => {
+        seen.push({ withFrames: /frame grabs/i.test(prompt), allowTools: allowTools || [] });
+        // The tool-using call fails; the plain text one works.
+        if (allowTools && allowTools.length) return { text: 'I cannot open those files.' };
+        return { text: '{"score":71,"rationale":"good","goods":["a"],"bads":["b"]}' };
+      };
+      const cand = { start_s: 10, end_s: 40, transcript: 'hi', audio_score: 0.5 };
+      const out = await worker.scoreCandidate(cand, worker.FALLBACK_RUBRIC, 'A Game',
+        [{ path: 'C:/tmp/frame01.jpg', atS: 10.8 }]);
+      assert.strictEqual(out.score, 71, 'the fallback score is used');
+      assert.ok(!out._error, 'it is NOT flagged unjudged');
+      assert.ok(out.bads.some(b => /without frames/i.test(b)), 'and it admits the visual is unverified');
+      assert.ok(seen[0].allowTools.includes('Read'), 'the first attempt asked to read the frames');
+      assert.ok(seen[0].withFrames, 'the first prompt actually listed the frames');
+      assert.strictEqual(seen[1].allowTools.length, 0, 'the retry dropped the tool');
+    } finally { claude.complete = real; }
+  });
+
   console.log(`\n${passed} passed`);
 })().catch((e) => { console.error(e); process.exit(1); });

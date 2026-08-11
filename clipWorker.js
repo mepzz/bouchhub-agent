@@ -138,22 +138,22 @@ function serialise(fn) {
 // output) and is transient, so an empty reply is retried once before giving up.
 const RETRY_DELAY_MS = Number(process.env.CLIPSCAN_RETRY_MS || 8000);
 
-async function ask(prompt, { provider = process.env.CLIPSCAN_PROVIDER || 'claude', timeoutMs = 180000 } = {}) {
-  const first = await serialise(() => askNow(prompt, { provider, timeoutMs }));
+async function ask(prompt, { provider = process.env.CLIPSCAN_PROVIDER || 'claude', timeoutMs = 180000, allowTools = [] } = {}) {
+  const first = await serialise(() => askNow(prompt, { provider, timeoutMs, allowTools }));
   if (first.text) return first;
   // A dead login is not transient — retrying it just doubles the wait on every
   // cut and buries the one thing you need to be told.
   if (require('./claude').authFailure(first.error)) return first;
   await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-  const second = await serialise(() => askNow(prompt, { provider, timeoutMs }));
+  const second = await serialise(() => askNow(prompt, { provider, timeoutMs, allowTools }));
   if (second.text) return second;
   return { text: '', error: `${second.error} (retried once)` };
 }
 
-async function askNow(prompt, { provider, timeoutMs }) {
+async function askNow(prompt, { provider, timeoutMs, allowTools = [] }) {
   const claude = require('./claude');
   try {
-    const r = await claude.complete({ provider, prompt, timeoutMs });
+    const r = await claude.complete({ provider, prompt, timeoutMs, allowTools });
     const text = (r && (r.text || r.output || r.stdout)) || '';
     // A non-zero exit with output is the CLI explaining a problem, not answering.
     if (r && r.code) return { text: '', error: `provider "${provider}" exited ${r.code}: ${text.slice(0, 200)}` };
@@ -369,8 +369,9 @@ function clampWindow(recommended, candidate, clipLenS = [7, 30], durationS = nul
   return { start: Math.round(s * 100) / 100, end: Math.round(e * 100) / 100 };
 }
 
-async function scoreCandidate(candidate, rubric, gameName) {
+async function scoreCandidate(candidate, rubric, gameName, frames = []) {
   const len = Math.round((candidate.end_s - candidate.start_s) * 10) / 10;
+  const rel = (t) => Math.round((t - candidate.start_s) * 10) / 10;
   const prompt = [
     `You are judging whether one moment from a ${gameName || 'game'} recording is worth posting as a short-form clip.`,
     ``,
@@ -383,6 +384,21 @@ async function scoreCandidate(candidate, rubric, gameName) {
     `- what is said during it: ${candidate.transcript ? JSON.stringify(candidate.transcript) : '(no speech in this window)'}`,
     `- audio energy: ${candidate.audio_score == null ? 'no spike' : candidate.audio_score + ' (0..1 above the recording baseline)'}`,
     ``,
+    ...(frames.length ? [
+      `WHAT IS ACTUALLY ON SCREEN. Read each of these frame grabs before scoring —`,
+      `they are stills from this exact window, and the first one is the opening frame:`,
+      ...frames.map(f => `- ${f.path}  (at ${rel(f.atS)}s into the clip)`),
+      ``,
+      `Judge the VISUALS from these frames. Do not say the visual is unconfirmed —`,
+      `you can see it. If the frames show the payoff is missing, unreadable or`,
+      `off-screen, say so and score it down; that is a real finding.`,
+      ``,
+    ] : [
+      `NOTE: no frame grabs are available for this moment, so you are judging from`,
+      `audio and transcript alone. Say so plainly in the rationale rather than`,
+      `speculating about what might be on screen.`,
+      ``,
+    ]),
     `Score 0-100 for how strongly you'd recommend POSTING this, blending: is there a clear payoff, would a viewer with no context understand it, and does it fit what performs for this game.`,
     `Be honest — most moments are mediocre. Reserve 80+ for clips you'd actually post.`,
     `The cut length is already decided and snapped to conversation breaks — judge the MOMENT, not the trim.`,
@@ -391,8 +407,23 @@ async function scoreCandidate(candidate, rubric, gameName) {
     `{"score":0-100,"rationale":"what happens and why it does or doesn't work","goods":["..."],"bads":["..."]}`,
   ].filter(Boolean).join('\n');
 
-  const a = await ask(prompt);
-  const j = extractJson(a.text);
+  // Reading the frames needs the Read tool; a text-only call has none.
+  let a = await ask(prompt, frames.length ? { allowTools: ['Read'] } : {});
+  let j = extractJson(a.text);
+  // If looking at the frames didn't work — the CLI rejected the tool, stalled on
+  // a permission prompt, whatever — fall back to the text-only judgement that
+  // was working before rather than losing the score entirely. Scoring blind is
+  // worse than scoring with eyes; it is much better than "review manually".
+  if (frames.length && (!j || typeof j.score !== 'number')) {
+    lastAskProblem = a.error || 'the judge could not use the frame grabs';
+    const blind = await scoreCandidate(candidate, rubric, gameName, []);
+    if (!blind._error) {
+      blind.bads = [...(blind.bads || []), 'judged without frames — the visual read is unverified'];
+      return blind;
+    }
+    a = { text: a.text, error: lastAskProblem };
+    j = null;
+  }
   if (!j || typeof j.score !== 'number') {
     lastAskProblem = a.error || `the judge replied but not with JSON: ${String(a.text).slice(0, 200)}`;
     // Never drop a moment because the judge misbehaved — the picker already
@@ -521,10 +552,31 @@ async function processRecording(agentId, rec, cfg) {
   const gameDir = path.join(cfg.outDir, sanitizeName(rec.game_name || rec.app_id), (rec.recorded_at || '').slice(0, 10) || 'undated');
   let made = 0;
   let unjudged = 0;
+  let blindWarned = false;   // say "judging blind" once per recording, not per cut
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i];
     await beat(agentId, `Scoring ${label} (${i + 1}/${candidates.length})`);
-    const judged = await scoreCandidate(c, rubric, rec.game_name);
+    // Let the judge SEE the moment. Best-effort on purpose: if ffmpeg can't
+    // produce stills we still score from audio and transcript, exactly as
+    // before, rather than losing scoring altogether.
+    let frames = [];
+    const frameDir = path.join(require('os').tmpdir(), `clipscan-frames-${rec.id}-${i}`);
+    try {
+      frames = await media.extractFrames(mp4, c.start_s, c.end_s, frameDir);
+      if (!frames.length && !blindWarned) {
+        blindWarned = true;
+        await note(agentId, 'warning',
+          `[${label}] could not grab frames — moments are being judged on audio and transcript only, so the scores will be conservative.`,
+          { recording_id: rec.id });
+      }
+    } catch (e) {
+      if (!blindWarned) {
+        blindWarned = true;
+        await note(agentId, 'warning', `[${label}] frame grab failed (${e.message}) — judging on audio only.`, { recording_id: rec.id });
+      }
+    }
+    const judged = await scoreCandidate(c, rubric, rec.game_name, frames);
+    try { fs.rmSync(frameDir, { recursive: true, force: true }); } catch (_) {}
     if (judged._error) unjudged++;
 
     // The window is already chosen, length-clamped and snapped to conversation
@@ -702,5 +754,5 @@ module.exports = {
   start, stop, status, resume,
   // exported for tests
   attachTranscripts, extractJson, transcribe, processRecording, sanitizeName,
-  clampWindow, FALLBACK_RUBRIC, buildTimeline, selectMoments, fmtTs, serialise, ask,
+  clampWindow, FALLBACK_RUBRIC, buildTimeline, selectMoments, fmtTs, serialise, ask, scoreCandidate,
 };

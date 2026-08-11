@@ -317,7 +317,10 @@ function excerpt(s) {
 // prompt is fed on stdin so long/multi-line prompts arrive intact. This is what
 // lets the hub's LLM features (Ideas, project to-dos, …) run on the Max/Pro
 // subscription instead of the metered API — the same account the handoff uses.
-async function complete({ provider = 'claude', prompt, timeoutMs = 180000 } = {}) {
+// `allowTools` pre-approves specific tools (e.g. ['Read']) so a completion can
+// LOOK at files — the clip judge needs to open frame grabs. Left empty the call
+// stays exactly as it was: pure text, no tools, nothing to approve.
+async function complete({ provider = 'claude', prompt, timeoutMs = 180000, allowTools = [] } = {}) {
   if (!prompt) throw new Error('complete needs a prompt');
   const p = providerOf(provider);
   const bin = _bins[provider] || (await resolveBin(provider)) || process.env[p.binEnv] || p.cli;
@@ -328,6 +331,9 @@ async function complete({ provider = 'claude', prompt, timeoutMs = 180000 } = {}
   // Minimal print-mode flags per provider (no --verbose / no permission flags —
   // a text completion uses no tools): claude/claude2 → -p, codex → exec, gemini → stdin.
   const args = [p.subcmd, p.pipeFlag].filter(Boolean);
+  // Only the claude family takes --allowedTools; for the others the prompt has
+  // to carry the content itself, so silently ignoring the hint is correct.
+  if (allowTools.length && p.cli === 'claude') args.push('--allowedTools', allowTools.join(','));
   try {
     const r = await run(bin, args, { timeoutMs, env: providerEnv(provider), stdinFile: tmp });
     const text = (r.out || '').trim();
