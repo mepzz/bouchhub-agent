@@ -616,10 +616,19 @@ async function makePreview(src, outPath, {
   // — the browser reports "waiting on data that is not arriving", which reads
   // like a broken file. A hard bitrate cap plus 30fps puts a 60s clip at a few
   // MB, which arrives fast enough to actually watch.
-  const r = await run(ffmpeg, ['-y', '-i', src,
+  const r = await run(ffmpeg, ['-y',
+    // Normalise timestamps. The source is byte-concatenated from hundreds of
+    // fragments, so its PTS can be non-monotonic or negative. Desktop players
+    // shrug that off; browsers play the first fraction of a second and then stop
+    // waiting for a timestamp that never comes — which looks exactly like a
+    // broken file even though the clip opens fine in VLC.
+    '-fflags', '+genpts',
+    '-i', src,
+    '-avoid_negative_ts', 'make_zero',
+    '-max_muxing_queue_size', '1024',
     // Never upscale, and force even dimensions (H.264 requires them).
     '-vf', `scale='min(${maxWidth},iw)':-2`,
-    '-r', '30',
+    '-r', '30', '-vsync', 'cfr',   // constant frame rate → evenly spaced, monotonic PTS
     '-c:v', 'libx264', '-profile:v', 'main', '-level:v', '4.0', '-pix_fmt', 'yuv420p',
     '-bf', '0', '-preset', 'veryfast',
     '-crf', '30', '-maxrate', `${maxRateK}k`, '-bufsize', `${maxRateK * 2}k`,
