@@ -390,5 +390,36 @@ async function atest(name, fn) {
     }
   });
 
+  await atest('a dead login is named, not mistaken for a model answer', async () => {
+    const claude = require('../claude');
+    // The exact reply the CLI gave on the live box, on STDOUT, with exit 1.
+    assert.ok(claude.authFailure('Failed to authenticate: OAuth session expired and could not be refreshed'),
+      'the expired-OAuth message is recognised');
+    assert.ok(claude.authFailure('Invalid API key · Please run /login'), 'so is a login prompt');
+    assert.strictEqual(claude.authFailure('{"score":42,"why":"the session expired in-game"}'), null,
+      'ordinary model output is not mistaken for an auth failure');
+    assert.strictEqual(claude.authFailure(''), null);
+  });
+
+  await atest('a non-zero exit is reported instead of being scored', async () => {
+    process.env.CLIPSCAN_RETRY_MS = '1';
+    const claude = require('../claude');
+    const real = claude.complete;
+    try {
+      let calls = 0;
+      claude.complete = async () => {
+        calls++;
+        return { text: 'Failed to authenticate: OAuth session expired and could not be refreshed', code: 1 };
+      };
+      const r = await worker.ask('score this');
+      assert.strictEqual(r.text, '', 'the error text is never handed back as a score');
+      assert.ok(/exited 1/.test(r.error) && /OAuth/.test(r.error), 'the reason survives to the board');
+      assert.strictEqual(calls, 1, 'and a dead login is not retried — it will not fix itself');
+    } finally {
+      claude.complete = real;
+      delete process.env.CLIPSCAN_RETRY_MS;
+    }
+  });
+
   console.log(`\n${passed} passed`);
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -252,7 +252,32 @@ async function status(provider = 'claude') {
   try { const j = JSON.parse(probe.out); apiError = j.api_error_status; } catch (_) {}
   const lim = parseLimit(text);
   const limited = lim.limited || apiError === 429 || /429/.test(String(apiError || ''));
-  return { provider, busy: false, usedPct: null, readable: false, limited, resetsInMin: lim.resetsInMin, raw: (limited ? text : 'not rate-limited').slice(0, 300) };
+  // A dead login looks nothing like a usage limit, but it used to report the
+  // same cheerful "not rate-limited" — which sent a whole debugging session
+  // after a concurrency ghost while the real answer was an expired OAuth token.
+  const authProblem = authFailure(text) || (probe.code !== 0 ? (probe.err || probe.out || '').trim() : null);
+  const authOk = !authProblem;
+  return {
+    provider, busy: false, usedPct: null, readable: false, limited, resetsInMin: lim.resetsInMin,
+    authOk,
+    // Where this provider's login actually lives, so a re-login goes to the
+    // right place: the agent may run as a different Windows user than you.
+    configDir: configDirFor(provider) || path.join(os.homedir(), '.claude'),
+    raw: (authProblem ? `NOT LOGGED IN — ${authProblem}` : limited ? text : 'not rate-limited').slice(0, 300),
+  };
+}
+
+// The provider CLIs report a dead/expired login as ordinary output, so it has to
+// be recognised by text. Kept in one place: complete() and status() must agree.
+// Both halves must appear on the SAME line: "session expired" on its own shows
+// up in perfectly good model output (a clip about an expired in-game session),
+// so a failure word only counts when something authentication-shaped is with it.
+const AUTH_ANCHOR = /\b(oauth|authenticat\w*|credentials?|api[ _-]?key|log ?in|logged in|unauthori[sz]ed|401)\b/i;
+const AUTH_FAILED = /\b(expired|invalid|failed|failure|revoked|refresh\w*|required|missing|denied|not)\b/i;
+function authFailure(text) {
+  const line = String(text || '').split('\n').map(s => s.trim())
+    .find(s => AUTH_ANCHOR.test(s) && AUTH_FAILED.test(s));
+  return line ? line.slice(0, 200) : null;
 }
 
 // ── One-shot completion on the owner's SUBSCRIPTION (no API cost) ─────────────
@@ -275,7 +300,12 @@ async function complete({ provider = 'claude', prompt, timeoutMs = 180000 } = {}
     const r = await run(bin, args, { timeoutMs, env: providerEnv(provider), stdinFile: tmp });
     const text = (r.out || '').trim();
     if (!text && r.code !== 0) throw new Error(`${provider} completion failed (code ${r.code}): ${(r.err || '').slice(0, 200)}`);
-    return { provider, text, code: r.code };
+    // The CLI prints "Failed to authenticate: OAuth session expired" to STDOUT
+    // and exits 1. Returning that as `text` makes it look like a model reply —
+    // callers then fail to parse it and blame themselves. Say what it is.
+    const authProblem = authFailure(`${text}\n${r.err || ''}`);
+    if (authProblem) throw new Error(`${provider} is not logged in: ${authProblem}`);
+    return { provider, text, code: r.code, authOk: true };
   } finally { try { fs.unlinkSync(tmp); } catch (_) {} }
 }
 
@@ -404,4 +434,5 @@ function consoleTail(arg, maybeLines) {
 module.exports = {
   status, work, complete, parseUsage, parseLimit, preflight, consoleTail,
   resolveBin, resolveClaude, PROVIDERS, logPathFor, workFolderFor, LOG_PATH,
+  authFailure,
 };

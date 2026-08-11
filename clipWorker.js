@@ -141,6 +141,9 @@ const RETRY_DELAY_MS = Number(process.env.CLIPSCAN_RETRY_MS || 8000);
 async function ask(prompt, { provider = process.env.CLIPSCAN_PROVIDER || 'claude', timeoutMs = 180000 } = {}) {
   const first = await serialise(() => askNow(prompt, { provider, timeoutMs }));
   if (first.text) return first;
+  // A dead login is not transient — retrying it just doubles the wait on every
+  // cut and buries the one thing you need to be told.
+  if (require('./claude').authFailure(first.error)) return first;
   await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
   const second = await serialise(() => askNow(prompt, { provider, timeoutMs }));
   if (second.text) return second;
@@ -152,6 +155,8 @@ async function askNow(prompt, { provider, timeoutMs }) {
   try {
     const r = await claude.complete({ provider, prompt, timeoutMs });
     const text = (r && (r.text || r.output || r.stdout)) || '';
+    // A non-zero exit with output is the CLI explaining a problem, not answering.
+    if (r && r.code) return { text: '', error: `provider "${provider}" exited ${r.code}: ${text.slice(0, 200)}` };
     if (text) return { text, error: null };
     const why = (r && (r.error || r.stderr)) || 'no output';
     return { text: '', error: `provider "${provider}" returned nothing (${String(why).slice(-200)})` };
