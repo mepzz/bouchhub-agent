@@ -248,22 +248,36 @@ async function status(provider = 'claude') {
   // added ~60s per cycle and made the dashboard sit on "checking usage". Gone.
   const probe = await run(bin, ['-p', 'ok', '--output-format', 'json'], { timeoutMs: 40000, env: providerEnv(provider) });
   const text = `${probe.out}\n${probe.err}`;
-  let apiError = null;
-  try { const j = JSON.parse(probe.out); apiError = j.api_error_status; } catch (_) {}
+  let apiError = null, cliErrored = false, cliMessage = null;
+  try {
+    const j = JSON.parse(probe.out);
+    apiError = j.api_error_status;
+    cliErrored = !!j.is_error;
+    if (typeof j.result === 'string') cliMessage = j.result;
+  } catch (_) {}
   const lim = parseLimit(text);
   const limited = lim.limited || apiError === 429 || /429/.test(String(apiError || ''));
   // A dead login looks nothing like a usage limit, but it used to report the
   // same cheerful "not rate-limited" — which sent a whole debugging session
   // after a concurrency ghost while the real answer was an expired OAuth token.
-  const authProblem = authFailure(text) || (probe.code !== 0 ? (probe.err || probe.out || '').trim() : null);
-  const authOk = !authProblem;
+  const authProblem = authFailure(text);
+  // A probe can fail for reasons that aren't a dead login. Say which it is
+  // rather than filing everything under "not logged in" — the two need
+  // completely different fixes.
+  const otherProblem = authProblem || limited ? null
+    : (cliErrored ? (cliMessage || 'the CLI reported an error but gave no message')
+      : probe.code !== 0 ? ((probe.err || probe.out || '').trim() || `exit ${probe.code}`)
+        : null);
+  const authOk = !authProblem && !otherProblem;
   return {
     provider, busy: false, usedPct: null, readable: false, limited, resetsInMin: lim.resetsInMin,
     authOk,
     // Where this provider's login actually lives, so a re-login goes to the
     // right place: the agent may run as a different Windows user than you.
     configDir: configDirFor(provider) || path.join(os.homedir(), '.claude'),
-    raw: (authProblem ? `NOT LOGGED IN — ${authProblem}` : limited ? text : 'not rate-limited').slice(0, 300),
+    raw: (authProblem ? `NOT LOGGED IN — ${authProblem}`
+      : otherProblem ? `PROVIDER ERROR — ${otherProblem}`
+        : limited ? text : 'not rate-limited').slice(0, 300),
   };
 }
 
@@ -275,9 +289,27 @@ async function status(provider = 'claude') {
 const AUTH_ANCHOR = /\b(oauth|authenticat\w*|credentials?|api[ _-]?key|log ?in|logged in|unauthori[sz]ed|401)\b/i;
 const AUTH_FAILED = /\b(expired|invalid|failed|failure|revoked|refresh\w*|required|missing|denied|not)\b/i;
 function authFailure(text) {
-  const line = String(text || '').split('\n').map(s => s.trim())
-    .find(s => AUTH_ANCHOR.test(s) && AUTH_FAILED.test(s));
-  return line ? line.slice(0, 200) : null;
+  for (const raw of String(text || '').split('\n')) {
+    const s = raw.trim();
+    if (!s) continue;
+    // --output-format json puts the human message in `result`, hundreds of
+    // characters into a single line. Reporting the first 200 chars of THAT is
+    // all session ids and token counts — the one sentence you need is cut off.
+    const msg = jsonResult(s) || s;
+    if (AUTH_ANCHOR.test(msg) && AUTH_FAILED.test(msg)) return excerpt(msg);
+  }
+  return null;
+}
+function jsonResult(line) {
+  if (line[0] !== '{') return null;
+  try { const j = JSON.parse(line); return typeof j.result === 'string' ? j.result : null; }
+  catch (_) { return null; }
+}
+// Quote the part that actually matched, not whatever happened to come first.
+function excerpt(s) {
+  const m = AUTH_ANCHOR.exec(s);
+  const from = Math.max(0, (m ? m.index : 0) - 60);
+  return (from ? '…' : '') + s.slice(from, from + 200);
 }
 
 // ── One-shot completion on the owner's SUBSCRIPTION (no API cost) ─────────────

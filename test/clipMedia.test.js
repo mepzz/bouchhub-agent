@@ -401,6 +401,22 @@ async function atest(name, fn) {
     assert.strictEqual(claude.authFailure(''), null);
   });
 
+  await atest('the reason is quoted from the message, not the front of the JSON blob', async () => {
+    const claude = require('../claude');
+    // What --output-format json really looks like: one line, the sentence you
+    // need buried behind session ids and token counts.
+    const line = JSON.stringify({
+      is_error: true, duration_api_ms: 0, num_turns: 1, stop_reason: 'stop_sequence',
+      session_id: '3e1fca55-a475-4979-8673-78cb75162e8e', total_cost_usd: 0,
+      usage: { input_tokens: 0, cache_creation_input_tokens: 0 },
+      result: 'Failed to authenticate: OAuth session expired and could not be refreshed',
+    });
+    const found = claude.authFailure(line);
+    assert.ok(found, 'the failure is still detected inside the JSON');
+    assert.ok(/OAuth session expired/.test(found), `the message is quoted, got: ${found}`);
+    assert.ok(!/session_id|total_cost_usd/.test(found), 'and the bookkeeping is left out');
+  });
+
   await atest('a non-zero exit is reported instead of being scored', async () => {
     process.env.CLIPSCAN_RETRY_MS = '1';
     const claude = require('../claude');
