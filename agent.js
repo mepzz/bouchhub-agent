@@ -8,6 +8,7 @@ const path = require('path');
 const { exec } = require('child_process');
 const simpleGit = require('simple-git');
 const express = require('express');
+const aida = require('./aida');
 
 // ─── Config ────────────────────────────────────────────────
 const { HUB_URL, AGENT_SECRET, DEVICE_ID, DEVICE_NAME, AGENT_PORT } = process.env;
@@ -173,17 +174,32 @@ async function collectStats() {
     lastNetStats = { time: now, adapters: psStats.net };
   }
 
+  // AIDA64 reads the motherboard's sensor chip directly, so where it has an
+  // answer it beats ours: Win32_Fan returns nothing on a desktop, and the ACPI
+  // thermal zone we fall back to is often several degrees off the CPU die.
+  // Entirely optional — when it isn't publishing, everything below is unchanged.
+  let aidaRead = { ok: false, sensors: [] };
+  try { aidaRead = await aida.read(); } catch (_) {}
+  const sensors = aidaRead.ok ? aida.summarise(aidaRead.sensors) : { cpuTemp: null, gpuTemp: null, memTemp: null, fans: [] };
+
+  const gpu = psStats.gpu ?? { model: 'N/A', temp: null, usage: null, vramUsed: null, vramTotal: null };
+
   cachedStats = {
-    cpu: { usage: cpuUsagePct, temp: psStats.cpuTemp ?? null, model: cpus[0]?.model?.trim() || 'Unknown', cores: cpus.length },
-    gpu: psStats.gpu ?? { model: 'N/A', temp: null, usage: null, vramUsed: null, vramTotal: null },
+    cpu: { usage: cpuUsagePct, temp: sensors.cpuTemp ?? psStats.cpuTemp ?? null, model: cpus[0]?.model?.trim() || 'Unknown', cores: cpus.length },
+    // nvidia-smi is authoritative for the GPU's own die, so AIDA64 only fills a gap.
+    gpu: { ...gpu, temp: gpu.temp ?? sensors.gpuTemp ?? null },
     ram: {
       used: Math.round(usedMem / 1024 / 1024 / 1024 * 10) / 10,
       total: Math.round(totalMem / 1024 / 1024 / 1024 * 10) / 10,
-      pct: Math.round((usedMem / totalMem) * 100)
+      pct: Math.round((usedMem / totalMem) * 100),
+      temp: sensors.memTemp ?? null
     },
     disks: psStats.disks ?? [],
     network,
-    fans: psStats.fans ?? [],
+    fans: sensors.fans.length ? sensors.fans : (psStats.fans ?? []),
+    // The full published list, so a display can mirror an AIDA64 panel item for
+    // item instead of being limited to the handful of fields mapped above.
+    aida: { ok: aidaRead.ok, enabled: !!aidaRead.enabled, error: aidaRead.error || null, sensors: aidaRead.sensors || [] },
     // Hardware health: SMART status per physical disk, battery charge/status.
     // Sentinel watches these for slow-degrade failures.
     smart: psStats.smart ?? [],
