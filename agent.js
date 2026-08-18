@@ -212,7 +212,7 @@ async function collectStats() {
 
 // ─── Express API ───────────────────────────────────────────
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '64mb' })); // BOUCH: base64 image uploads (faces, hero stills) exceed the 100kb default
 
 app.use((req, res, next) => {
   if (req.headers['x-agent-secret'] !== AGENT_SECRET) return res.status(403).json({ error: 'Forbidden' });
