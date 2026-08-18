@@ -9,6 +9,7 @@ const { exec } = require('child_process');
 const simpleGit = require('simple-git');
 const express = require('express');
 const aida = require('./aida');
+const local = require('./local');
 
 // ─── Config ────────────────────────────────────────────────
 const { HUB_URL, AGENT_SECRET, DEVICE_ID, DEVICE_NAME, AGENT_PORT } = process.env;
@@ -219,6 +220,57 @@ app.use((req, res, next) => {
 });
 
 app.get('/stats', (req, res) => res.json(cachedStats));
+
+// ─── Local AI stack (Ollama + ComfyUI) ─────────────────────────────────────
+// These proxy to services bound to 127.0.0.1 on this PC. They are reachable
+// only through this agent, which the AGENT_SECRET check above already guards,
+// so the local model and generation queue never sit open on the LAN.
+app.get('/local/health', async (req, res) => {
+  try { res.json(await local.health()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/local/chat', async (req, res) => {
+  try { res.json(await local.chat(req.body || {})); }
+  catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+app.post('/local/unload', async (req, res) => {
+  res.json(await local.unloadText(req.body?.model));
+});
+
+// Run a workflow. `unloadText` first is the difference between a generation
+// that fits in 16GB and one that dies halfway: a resident 27B model and FLUX
+// will not share the card.
+app.post('/local/comfy/run', async (req, res) => {
+  try {
+    if (req.body?.unloadText !== false) await local.unloadText();
+    const result = await local.runWorkflow(req.body.workflow, { timeoutMs: req.body.timeoutMs });
+    res.json(result);
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+// Hand a produced file back as raw bytes for the hub to store.
+app.get('/local/comfy/file', async (req, res) => {
+  try {
+    const { buffer, contentType } = await local.fetchOutput({
+      filename: req.query.filename, subfolder: req.query.subfolder || '', type: req.query.type || 'output',
+    });
+    res.set('Content-Type', contentType).send(buffer);
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+// Put an image INTO ComfyUI — face references, or a hero still on its way to
+// the video workflow. Body: { filename, dataBase64 }.
+app.post('/local/comfy/upload', async (req, res) => {
+  try {
+    const buf = Buffer.from(String(req.body.dataBase64 || ''), 'base64');
+    if (!buf.length) return res.status(400).json({ error: 'no image data' });
+    res.json(await local.uploadInput(buf, req.body.filename || `upload-${Date.now()}.png`));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+app.post('/local/comfy/interrupt', async (req, res) => res.json(await local.interrupt()));
 
 app.get('/info', (req, res) => {
   res.json({
