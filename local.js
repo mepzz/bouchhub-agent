@@ -77,7 +77,28 @@ async function chat({ messages, model = TEXT_MODEL, temperature = 0.8, maxTokens
     keep_alive: `${keepAliveS}s`,
   };
   const r = await jsonReq(`${OLLAMA}/v1/chat/completions`, { method: 'POST', body, timeoutMs: 600000 });
-  return { text: r.choices?.[0]?.message?.content || '', model: r.model || model, usage: r.usage || null };
+  const raw = r.choices?.[0]?.message?.content || '';
+  return { text: stripThinking(raw), thinking: thinkingOf(raw), model: r.model || model, usage: r.usage || null };
+}
+
+// GLM-4.7-Flash is a reasoning model: it emits its scratchpad inside <think>
+// tags before the answer. Handing that to a chat bubble, or to a prompt field
+// that feeds FLUX, means the reasoning becomes the output. Strip it — and keep
+// it separately, because when a reply is wrong the scratchpad is usually where
+// the reason is.
+const THINK_RE = /<think>[\s\S]*?<\/think>/gi;
+function stripThinking(text) {
+  let out = String(text || '').replace(THINK_RE, '');
+  // An unterminated block means the model ran out of tokens mid-thought; keep
+  // what follows the last opener rather than returning the whole scratchpad.
+  const open = out.lastIndexOf('<think>');
+  if (open !== -1) out = out.slice(open + 7).replace(/<\/?think>/gi, '');
+  return out.trim();
+}
+function thinkingOf(text) {
+  const found = String(text || '').match(THINK_RE) || [];
+  const joined = found.map(t => t.replace(/<\/?think>/gi, '').trim()).join('\n').trim();
+  return joined || null;
 }
 
 // Drop the text model out of VRAM. This is the switch that makes 16GB workable:
@@ -168,7 +189,50 @@ async function interrupt() {
   catch (e) { return { ok: false, error: reason(e) }; }
 }
 
+// ── The face-match photo pipeline ────────────────────────────────────────────
+// Three stages, because only the middle one needs Python: ComfyUI generates the
+// base image, insightface swaps the faces in frame order, ComfyUI restores and
+// upscales. The swap has to run in ComfyUI's own venv — that is the interpreter
+// with insightface — so it goes out as a subprocess rather than being reimplemented.
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const { execFile } = require('child_process');
+
+const COMFY_HOME = process.env.COMFY_HOME || path.join(os.homedir(), 'AI', 'ComfyUI');
+const COMFY_PYTHON = process.env.COMFY_PYTHON || path.join(COMFY_HOME, '.venv', 'Scripts', 'python.exe');
+const SWAPPER = process.env.INSWAPPER_PATH || path.join(COMFY_HOME, 'models', 'insightface', 'inswapper_128.onnx');
+
+function runPython(args, { timeoutMs = 10 * 60 * 1000 } = {}) {
+  return new Promise((resolve) => {
+    execFile(COMFY_PYTHON, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout, stderr) => resolve({ code: err ? (err.code ?? 1) : 0, stdout: String(stdout || ''), stderr: String(stderr || '') }));
+  });
+}
+
+// Swap reference faces into a generated image, left to right.
+async function swapFaces({ basePath, refPaths, outPath }) {
+  if (!fs.existsSync(COMFY_PYTHON)) {
+    throw new Error(`ComfyUI's python is not at ${COMFY_PYTHON} — set COMFY_PYTHON in the agent .env. The swap needs the interpreter that has insightface.`);
+  }
+  if (!fs.existsSync(SWAPPER)) {
+    throw new Error(`the face model is missing: ${SWAPPER}`);
+  }
+  const args = [path.join(__dirname, 'scripts', 'faceswap.py'),
+    '--base', basePath, '--out', outPath, '--swapper', SWAPPER];
+  for (const r of refPaths) args.push('--ref', r);
+
+  const r = await runPython(args);
+  let parsed = null;
+  try { parsed = JSON.parse((r.stdout.trim().split('\n').filter(Boolean).pop()) || '{}'); } catch (_) {}
+  if (!parsed || !parsed.ok) {
+    throw new Error((parsed && parsed.error) || `the face swap failed: ${(r.stderr || r.stdout || 'no output').slice(-300)}`);
+  }
+  return parsed;
+}
+
 module.exports = {
   health, chat, unloadText, runWorkflow, fetchOutput, uploadInput, interrupt,
-  OLLAMA, COMFY, TEXT_MODEL, comfyError,
+  swapFaces, stripThinking, thinkingOf,
+  OLLAMA, COMFY, TEXT_MODEL, COMFY_HOME, COMFY_PYTHON, SWAPPER, comfyError,
 };

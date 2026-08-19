@@ -272,6 +272,68 @@ app.post('/local/comfy/upload', async (req, res) => {
 
 app.post('/local/comfy/interrupt', async (req, res) => res.json(await local.interrupt()));
 
+// The face-match photo pipeline, end to end. Three stages: ComfyUI makes the
+// base image, insightface swaps the faces in frame order, ComfyUI restores and
+// upscales. Orchestrated here because stage two is a subprocess and the other
+// two are ordinary workflow runs.
+//
+// Body: { baseWorkflow, finishWorkflow, refs:[{slot,dataBase64}], keepBase }
+app.post('/local/comfy/faceswap-photo', async (req, res) => {
+  const fsp = require('fs');
+  const pathMod = require('path');
+  const osMod = require('os');
+  const work = fsp.mkdtempSync(pathMod.join(osMod.tmpdir(), 'bouch-photo-'));
+  const stages = [];
+  try {
+    // The text model and FLUX Q8 will not share a 16GB card.
+    await local.unloadText();
+
+    // 1 — base image
+    const t0 = Date.now();
+    const base = await local.runWorkflow(req.body.baseWorkflow, { timeoutMs: 15 * 60 * 1000 });
+    const baseFile = base.files[base.files.length - 1];
+    const baseBytes = await local.fetchOutput(baseFile);
+    const basePath = pathMod.join(work, 'base.png');
+    fsp.writeFileSync(basePath, baseBytes.buffer);
+    stages.push({ stage: 'base', ms: Date.now() - t0 });
+
+    // 2 — positional swap, in ComfyUI's venv
+    const t1 = Date.now();
+    const refPaths = (req.body.refs || []).map((r, i) => {
+      const p = pathMod.join(work, `ref${i}${r.ext || '.png'}`);
+      fsp.writeFileSync(p, Buffer.from(String(r.dataBase64 || ''), 'base64'));
+      return p;
+    });
+    if (!refPaths.length) throw new Error('no reference faces were sent');
+    const swapPath = pathMod.join(work, 'swapped.png');
+    const swap = await local.swapFaces({ basePath, refPaths, outPath: swapPath });
+    stages.push({ stage: 'swap', ms: Date.now() - t1, ...swap });
+
+    // 3 — restore + upscale
+    const t2 = Date.now();
+    const up = await local.uploadInput(fsp.readFileSync(swapPath), `bouch-swap-${Date.now()}.png`);
+    const finishWorkflow = JSON.parse(JSON.stringify(req.body.finishWorkflow));
+    for (const node of Object.values(finishWorkflow)) {
+      if (node && node._meta && node._meta.title === 'BOUCH_INPUT_IMAGE') node.inputs.image = up.name;
+    }
+    const done = await local.runWorkflow(finishWorkflow, { timeoutMs: 15 * 60 * 1000 });
+    stages.push({ stage: 'finish', ms: Date.now() - t2 });
+
+    res.json({
+      files: done.files, file: done.files[done.files.length - 1],
+      stages, tookMs: stages.reduce((a, s) => a + s.ms, 0),
+      // Worth surfacing: a CPU swap is about a minute and explains an otherwise
+      // baffling wait on an otherwise fast machine.
+      swapProvider: swap.provider, facesDetected: swap.facesDetected,
+      swapped: swap.swapped, note: swap.note || null,
+    });
+  } catch (e) {
+    res.status(502).json({ error: e.message, stages });
+  } finally {
+    try { fsp.rmSync(work, { recursive: true, force: true }); } catch (_) {}
+  }
+});
+
 app.get('/info', (req, res) => {
   res.json({
     deviceId: DEVICE_ID, deviceName: DEVICE_NAME,
