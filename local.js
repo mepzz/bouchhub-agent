@@ -13,6 +13,8 @@
 const OLLAMA = process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
 const COMFY = process.env.COMFY_URL || 'http://127.0.0.1:8188';
 const TEXT_MODEL = process.env.LOCAL_TEXT_MODEL || 'qwen3-27b-uncensored';
+// Vision is a separate model and only loads on turns that carry an image.
+const VISION_MODEL = process.env.LOCAL_VISION_MODEL || '';
 
 function f() { return global.fetch || require('node-fetch'); }
 
@@ -38,13 +40,16 @@ async function jsonReq(url, { method = 'GET', body, timeoutMs = 120000 } = {}) {
 // Reports each service separately. Half a stack is a normal state to be in
 // while it is still being set up, and the UI needs to say which half.
 async function health() {
-  const out = { textModel: TEXT_MODEL, ollama: { ok: false }, comfy: { ok: false } };
+  // Both model names come from THIS machine's .env and are reported outward,
+  // so the hub never has to keep a second copy of them in sync.
+  const out = { textModel: TEXT_MODEL, visionModel: VISION_MODEL || null, ollama: { ok: false }, comfy: { ok: false } };
   try {
     const tags = await jsonReq(`${OLLAMA}/api/tags`, { timeoutMs: 5000 });
     out.ollama = {
       ok: true,
       models: (tags.models || []).map(m => m.name),
       hasTextModel: (tags.models || []).some(m => m.name === TEXT_MODEL || m.name.startsWith(TEXT_MODEL.split(':')[0])),
+      hasVisionModel: !VISION_MODEL ? null : (tags.models || []).some(m => m.name === VISION_MODEL || m.name.startsWith(VISION_MODEL.split(':')[0])),
     };
   } catch (e) { out.ollama = { ok: false, error: reason(e) }; }
   try {
@@ -234,5 +239,5 @@ async function swapFaces({ basePath, refPaths, outPath }) {
 module.exports = {
   health, chat, unloadText, runWorkflow, fetchOutput, uploadInput, interrupt,
   swapFaces, stripThinking, thinkingOf,
-  OLLAMA, COMFY, TEXT_MODEL, COMFY_HOME, COMFY_PYTHON, SWAPPER, comfyError,
+  OLLAMA, COMFY, TEXT_MODEL, VISION_MODEL, COMFY_HOME, COMFY_PYTHON, SWAPPER, comfyError,
 };
