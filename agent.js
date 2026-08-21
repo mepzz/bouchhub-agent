@@ -279,6 +279,47 @@ app.post('/local/comfy/upload', async (req, res) => {
 
 app.post('/local/comfy/interrupt', async (req, res) => res.json(await local.interrupt()));
 
+// Is Alex at the machine? The deputy only works while he is away, so this has
+// to be a real signal rather than a guess from clock time. GetLastInputInfo is
+// the one Windows itself uses for the idle timer, and it counts keyboard and
+// mouse across every session — not just this process.
+//
+// A full-screen app also counts as "in use": he may be watching something
+// without touching anything, and taking the GPU then would be worse than
+// taking it while he types.
+app.get('/idle', async (req, res) => {
+  const script = `
+Add-Type @"
+using System;using System.Runtime.InteropServices;
+public class I { [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+[DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO p);
+[DllImport("kernel32.dll")] public static extern uint GetTickCount(); }
+"@
+$i = New-Object I+LASTINPUTINFO; $i.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($i)
+[void][I]::GetLastInputInfo([ref]$i)
+$idle = [math]::Round(([I]::GetTickCount() - $i.dwTime) / 1000)
+$busy = @(Get-Process -EA SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $_.ProcessName -match 'valorant|steam_app|rl|fortnite|obs|vlc|mpc|netflix' }).Count
+@{ idleSeconds = $idle; foregroundBusy = ($busy -gt 0) } | ConvertTo-Json -Compress`.trim();
+  try {
+    const out = await runPS(script, 15000);
+    const parsed = JSON.parse(out);
+    const idleSeconds = Number(parsed.idleSeconds) || 0;
+    const thresholdS = Number(req.query.thresholdS) || 600;
+    res.json({
+      idleSeconds,
+      thresholdS,
+      // "Away" is idle past the threshold AND nothing playing. Both, because
+      // either alone gets it wrong in a way Alex would notice.
+      away: idleSeconds >= thresholdS && !parsed.foregroundBusy,
+      foregroundBusy: !!parsed.foregroundBusy,
+    });
+  } catch (e) {
+    // Unknown is not away. Failing to read the idle timer must never be read
+    // as permission to start work.
+    res.json({ idleSeconds: 0, away: false, error: e.message });
+  }
+});
+
 // The face-match photo pipeline, end to end. Three stages: ComfyUI makes the
 // base image, insightface swaps the faces in frame order, ComfyUI restores and
 // upscales. Orchestrated here because stage two is a subprocess and the other
