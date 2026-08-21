@@ -52,6 +52,28 @@ async function health() {
       hasVisionModel: !VISION_MODEL ? null : (tags.models || []).some(m => m.name === VISION_MODEL || m.name.startsWith(VISION_MODEL.split(':')[0])),
     };
   } catch (e) { out.ollama = { ok: false, error: reason(e) }; }
+  // Where the text model actually lives. Ollama reports, per loaded model, the
+  // total size and how much of it is resident in VRAM; anything short of the
+  // whole thing is running partly on the CPU. This is not a detail — a 30B at
+  // Q4 does not fit in 16GB, so it gets split, and the CPU half is both slow
+  // and the thing that runs out of memory. Worth measuring rather than assuming.
+  try {
+    const ps = await jsonReq(`${OLLAMA}/api/ps`, { timeoutMs: 5000 });
+    out.loaded = (ps.models || []).map(m => {
+      const total = m.size || 0;
+      const vram = m.size_vram || 0;
+      return {
+        name: m.name,
+        totalMB: Math.round(total / 1048576),
+        vramMB: Math.round(vram / 1048576),
+        onGpuPct: total ? Math.round((vram / total) * 100) : null,
+        // Below 100% means layers are on the CPU. Say so plainly here so the
+        // answer to "is it using the GPU" is a number, not an opinion.
+        fullyOnGpu: total > 0 && vram >= total,
+      };
+    });
+  } catch (_) { out.loaded = []; }
+
   try {
     const stats = await jsonReq(`${COMFY}/system_stats`, { timeoutMs: 5000 });
     const gpu = (stats.devices || [])[0] || {};
