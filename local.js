@@ -81,7 +81,19 @@ async function chat({ messages, model = TEXT_MODEL, temperature = 0.8, maxTokens
     // so a 27B model isn't sitting on VRAM that FLUX is about to need.
     keep_alive: `${keepAliveS}s`,
   };
-  const r = await jsonReq(`${OLLAMA}/v1/chat/completions`, { method: 'POST', body, timeoutMs: 600000 });
+  let r;
+  try {
+    r = await jsonReq(`${OLLAMA}/v1/chat/completions`, { method: 'POST', body, timeoutMs: 600000 });
+  } catch (e) {
+    // "failed to allocate" almost always means ComfyUI is still holding the
+    // card and the host memory from a generation. Free it and try once more,
+    // rather than handing back a wall of ggml output that only says the same
+    // thing in a language nobody wants to read at that moment.
+    if (!OUT_OF_MEMORY.test(e.message)) throw e;
+    await freeComfy();
+    await new Promise(res => setTimeout(res, 2000));
+    r = await jsonReq(`${OLLAMA}/v1/chat/completions`, { method: 'POST', body, timeoutMs: 600000 });
+  }
   const raw = r.choices?.[0]?.message?.content || '';
   return { text: stripThinking(raw), thinking: thinkingOf(raw), model: r.model || model, usage: r.usage || null };
 }
@@ -91,6 +103,9 @@ async function chat({ messages, model = TEXT_MODEL, temperature = 0.8, maxTokens
 // that feeds FLUX, means the reasoning becomes the output. Strip it — and keep
 // it separately, because when a reply is wrong the scratchpad is usually where
 // the reason is.
+// What an exhausted machine looks like across llama.cpp, CUDA and ggml.
+const OUT_OF_MEMORY = /failed to allocate|out of memory|cudaMalloc|alloc_tensor_range|CUDA_Host|process has terminated/i;
+
 const THINK_RE = /<think>[\s\S]*?<\/think>/gi;
 function stripThinking(text) {
   let out = String(text || '').replace(THINK_RE, '');
@@ -104,6 +119,19 @@ function thinkingOf(text) {
   const found = String(text || '').match(THINK_RE) || [];
   const joined = found.map(t => t.replace(/<\/?think>/gi, '').trim()).join('\n').trim();
   return joined || null;
+}
+
+// Free ComfyUI's models. The mirror of unloadText, and just as necessary: after
+// a generation, FLUX stays resident in both VRAM and pinned host memory, and
+// the next chat turn cannot allocate its buffers. Managing memory in only one
+// direction means the first thing you do after making a picture fails.
+async function freeComfy({ unloadModels = true } = {}) {
+  try {
+    await jsonReq(`${COMFY}/free`, {
+      method: 'POST', body: { unload_models: unloadModels, free_memory: true }, timeoutMs: 60000,
+    });
+    return { ok: true };
+  } catch (e) { return { ok: false, error: reason(e) }; }
 }
 
 // Drop the text model out of VRAM. This is the switch that makes 16GB workable:
@@ -238,6 +266,6 @@ async function swapFaces({ basePath, refPaths, outPath }) {
 
 module.exports = {
   health, chat, unloadText, runWorkflow, fetchOutput, uploadInput, interrupt,
-  swapFaces, stripThinking, thinkingOf,
+  swapFaces, stripThinking, thinkingOf, freeComfy, OUT_OF_MEMORY,
   OLLAMA, COMFY, TEXT_MODEL, VISION_MODEL, COMFY_HOME, COMFY_PYTHON, SWAPPER, comfyError,
 };

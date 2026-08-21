@@ -235,8 +235,15 @@ app.post('/local/chat', async (req, res) => {
   catch (e) { res.status(502).json({ error: e.message }); }
 });
 
+// Free the machine. `both` by default, because the reason anyone presses this
+// is that something will not fit, and unloading only one side leaves the other
+// holding the memory.
 app.post('/local/unload', async (req, res) => {
-  res.json(await local.unloadText(req.body?.model));
+  const what = req.body?.what || 'both';
+  const out = {};
+  if (what === 'text' || what === 'both') out.text = await local.unloadText(req.body?.model);
+  if (what === 'comfy' || what === 'both') out.comfy = await local.freeComfy();
+  res.json({ ok: Object.values(out).some(r => r && r.ok), ...out });
 });
 
 // Run a workflow. `unloadText` first is the difference between a generation
