@@ -1,0 +1,17 @@
+﻿{
+  "name": "scandi-light",
+  "description": "Light woods, airy spaces, functional simplicity.",
+  "prompts": {
+    "living_room": [
+      "Scandinavian style living room with light oak furniture, white walls, and green plants.",
+      "Bright airy space with minimal furniture and natural light.",
+      "Light-filled interior with light grey furniture and white textiles."
+    ],
+    "bedroom": [
+      "Light and airy Scandinavian bedroom with light oak bed and white linens.",
+      "Minimalist bedroom with a focus on light and space."
+    ]
+  },
+  "negative_prompts": ["dark wood", "heavy textures", "cluttered", "black furniture"],
+  "classifier_heuristic": "If tags contain 'scandi' or 'nordic' or 'light wood' or 'airy'."
+}

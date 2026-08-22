@@ -1,0 +1,16 @@
+﻿{
+  "name": "modern-warm",
+  "description": "Warm tones, organic textures, mid-century modern furniture.",
+  "prompts": {
+    "living_room": [
+      "A cozy living room with a warm beige sofa, walnut coffee table, and a large rug.",
+      "Minimalist interior design with warm accent lighting and soft textures."
+    ],
+    "bedroom": [
+      "Warm-toned bedroom with earthy bedding and rattan furniture.",
+      "Relaxing atmosphere with sunset lighting and wooden accents."
+    ]
+  },
+  "negative_prompts": ["cold colors", "minimalist white", "industrial metal", "sharp edges"],
+  "classifier_heuristic": "If tags contain 'modern' or 'warm' or 'beige'."
+}

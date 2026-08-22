@@ -1,0 +1,16 @@
+﻿{
+  "name": "transitional",
+  "description": "Mix of traditional and modern styles, neutral palettes.",
+  "prompts": {
+    "living_room": [
+      "Transitional style living room mixing traditional patterns with modern furniture.",
+      "Neutral color palette with beige and grey tones and contemporary accents."
+    ],
+    "kitchen": [
+      "Modern kitchen with transitional cabinetry and stainless steel appliances.",
+      "Clean kitchen design with mixed materials and neutral finishes."
+    ]
+  },
+  "negative_prompts": ["overly ornate", "retro", "ultra-modern", "brutalist"],
+  "classifier_heuristic": "If tags contain 'transitional' or 'mix' or 'neutral'."
+}

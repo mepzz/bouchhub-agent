@@ -1,0 +1,15 @@
+﻿{
+  "version": "1.0.0",
+  "attempt": 1,
+  "timestamp": "$(Get-Date -Format 'o')",
+  "components": {
+    "provider_interface": "src/stage/Provider.ts",
+    "local_stub": "src/stage/LocalStub.ts",
+    "api_adapter": "src/stage/ApiAdapter.ts",
+    "style_packs": [
+      "styles/modern-warm.json",
+      "styles/scandi-light.json",
+      "styles/transitional.json"
+    ]
+  }
+}
