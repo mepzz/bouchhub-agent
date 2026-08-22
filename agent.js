@@ -637,9 +637,14 @@ termApp.listen(TERM_PORT, '0.0.0.0', () => {
 app.post('/command', async (req, res) => {
   const { command } = req.body;
   if (!command) return res.status(400).json({ error: 'Missing command' });
+  // Thirty seconds is right for the chat tab, where someone is watching a
+  // spinner. It is not right for a test run or a push, which the deputy does
+  // unattended — those were being killed halfway and reported as failures.
+  // Caller's choice, with a ceiling, and the old default when it says nothing.
+  const timeout = Math.min(Math.max(Number(req.body.timeoutMs) || 30000, 1000), 15 * 60 * 1000);
   try {
     const output = await new Promise((resolve, reject) => {
-      exec(command, { shell: 'powershell.exe', timeout: 30000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+      exec(command, { shell: 'powershell.exe', timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
         if (err && !stdout) return reject(err);
         resolve((stdout || '') + (stderr || ''));
       });
