@@ -96,7 +96,11 @@ function reason(e) {
 // ── Text ─────────────────────────────────────────────────────────────────────
 // Ollama's OpenAI-compatible endpoint, so the same call shape works if this is
 // ever pointed at llama.cpp's server or anything else that speaks it.
-async function chat({ messages, model = TEXT_MODEL, temperature = 0.8, maxTokens = 2048, keepAliveS = 300 }) {
+// 4096 rather than 2048 because the default model reasons before it answers,
+// and a budget that a long prompt's thinking can exhaust produces a reply that
+// is entirely scratchpad — which strips to nothing and reads, downstream, as
+// "the model returned an empty reply".
+async function chat({ messages, model = TEXT_MODEL, temperature = 0.8, maxTokens = 4096, keepAliveS = 300 }) {
   const body = {
     model, messages, temperature, max_tokens: maxTokens,
     // keep_alive controls how long the weights stay resident. Short by default
@@ -117,7 +121,31 @@ async function chat({ messages, model = TEXT_MODEL, temperature = 0.8, maxTokens
     r = await jsonReq(`${OLLAMA}/v1/chat/completions`, { method: 'POST', body, timeoutMs: 600000 });
   }
   const raw = r.choices?.[0]?.message?.content || '';
-  return { text: stripThinking(raw), thinking: thinkingOf(raw), model: r.model || model, usage: r.usage || null };
+  const finish = r.choices?.[0]?.finish_reason || null;
+  let text = stripThinking(raw);
+  const thinking = thinkingOf(raw);
+
+  // A reasoning model that spends its whole budget thinking closes the tag and
+  // stops, leaving nothing outside it. Stripping that correctly returns an
+  // empty string, and an empty string tells the caller nothing about why.
+  //
+  // The scratchpad is the only content there is, and when the answer was going
+  // to be JSON the JSON is usually already in it. Hand it over rather than
+  // nothing, and say that is what happened.
+  const spentOnThinking = !text && !!thinking;
+  if (spentOnThinking) text = thinking;
+
+  return {
+    text,
+    thinking,
+    model: r.model || model,
+    usage: r.usage || null,
+    finishReason: finish,
+    // Two different problems that used to look identical downstream.
+    truncated: finish === 'length',
+    answeredFromThinking: spentOnThinking || undefined,
+    empty: !text ? (raw ? 'the model produced only markup' : 'the model produced no output at all') : undefined,
+  };
 }
 
 // GLM-4.7-Flash is a reasoning model: it emits its scratchpad inside <think>
