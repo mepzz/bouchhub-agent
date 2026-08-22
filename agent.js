@@ -284,9 +284,14 @@ app.post('/local/comfy/interrupt', async (req, res) => res.json(await local.inte
 // the one Windows itself uses for the idle timer, and it counts keyboard and
 // mouse across every session — not just this process.
 //
-// A full-screen app also counts as "in use": he may be watching something
-// without touching anything, and taking the GPU then would be worse than
-// taking it while he types.
+// A media or game window also counts as "in use": he may be watching something
+// without touching anything, and taking the GPU then would be worse than taking
+// it while he types.
+//
+// Matched by EXACT process name. A substring match here is not a small mistake:
+// -match 'rl' hits "NVIDIA Overlay" and "EOSOverlayRenderer", both of which run
+// permanently, so the machine reports itself busy forever and the deputy never
+// starts. It did exactly that.
 // ─── Hub watchdog ───────────────────────────────────────────────────────────
 // The deputy works unattended, so the thing most likely to go unnoticed is the
 // hub going down at 3am and staying down. This agent runs on the same machine
@@ -359,7 +364,8 @@ public class I { [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTIN
 $i = New-Object I+LASTINPUTINFO; $i.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($i)
 [void][I]::GetLastInputInfo([ref]$i)
 $idle = [math]::Round(([I]::GetTickCount() - $i.dwTime) / 1000)
-$busy = @(Get-Process -EA SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $_.ProcessName -match 'valorant|steam_app|rl|fortnite|obs|vlc|mpc|netflix' }).Count
+$watch = @('valorant','valorant-win64-shipping','rocketleague','fortniteclient-win64-shipping','obs64','obs32','vlc','mpc-hc64','mpc-be64','netflix','wmplayer')
+$busy = @(Get-Process -EA SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $watch -contains $_.ProcessName }).Count
 @{ idleSeconds = $idle; foregroundBusy = ($busy -gt 0) } | ConvertTo-Json -Compress`.trim();
   try {
     const out = await runPS(script, 15000);
