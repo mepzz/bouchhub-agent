@@ -287,6 +287,67 @@ app.post('/local/comfy/interrupt', async (req, res) => res.json(await local.inte
 // A full-screen app also counts as "in use": he may be watching something
 // without touching anything, and taking the GPU then would be worse than
 // taking it while he types.
+// ─── Hub watchdog ───────────────────────────────────────────────────────────
+// The deputy works unattended, so the thing most likely to go unnoticed is the
+// hub going down at 3am and staying down. This agent runs on the same machine
+// and outlives the hub, which makes it the right place to watch from.
+//
+// Deliberately conservative: several consecutive failures before acting, one
+// restart per cooldown, and it gives up rather than looping. A watchdog that
+// restarts a genuinely broken hub every minute turns one outage into a
+// thousand log lines and hides the actual cause.
+const WATCHDOG = {
+  enabled: process.env.HUB_WATCHDOG !== '0',
+  failures: 0,
+  needed: Number(process.env.HUB_WATCHDOG_FAILURES || 3),
+  lastRestart: 0,
+  cooldownMs: Number(process.env.HUB_WATCHDOG_COOLDOWN_MS || 10 * 60 * 1000),
+  restarts: 0,
+  maxRestarts: Number(process.env.HUB_WATCHDOG_MAX || 3),
+};
+
+async function checkHub() {
+  if (!WATCHDOG.enabled || isShuttingDown) return;
+  let ok = false;
+  try {
+    const res = await fetch(`${HUB_URL}/api/health`, { timeout: 10000 });
+    ok = res.ok;
+  } catch (_) { ok = false; }
+
+  if (ok) {
+    if (WATCHDOG.failures) console.log(`[Watchdog] hub is back after ${WATCHDOG.failures} failed check(s)`);
+    WATCHDOG.failures = 0;
+    WATCHDOG.restarts = 0;          // a healthy hub resets the budget
+    return;
+  }
+
+  WATCHDOG.failures++;
+  console.warn(`[Watchdog] hub health check failed (${WATCHDOG.failures}/${WATCHDOG.needed})`);
+  if (WATCHDOG.failures < WATCHDOG.needed) return;
+
+  const since = Date.now() - WATCHDOG.lastRestart;
+  if (since < WATCHDOG.cooldownMs) return;
+  if (WATCHDOG.restarts >= WATCHDOG.maxRestarts) {
+    // Stop trying. If three restarts did not fix it, a fourth will not either,
+    // and the loop would bury the reason.
+    console.error(`[Watchdog] hub still down after ${WATCHDOG.restarts} restarts — leaving it alone`);
+    return;
+  }
+
+  WATCHDOG.lastRestart = Date.now();
+  WATCHDOG.restarts++;
+  console.warn(`[Watchdog] restarting the hub (attempt ${WATCHDOG.restarts}/${WATCHDOG.maxRestarts})`);
+  const cmd = process.env.HUB_START_CMD
+    || `powershell -NoProfile -Command "Start-Process -WindowStyle Hidden node -ArgumentList 'server.js' -WorkingDirectory '${process.env.HUB_DIR || (os.homedir() + '\\Downloads\\bouchhub\\hub')}'"`;
+  exec(cmd, { windowsHide: true, timeout: 60000 }, (err) => {
+    if (err) console.error(`[Watchdog] restart failed: ${err.message}`);
+  });
+}
+
+app.get('/watchdog', (req, res) => res.json({
+  ...WATCHDOG, hubUrl: HUB_URL,
+}));
+
 app.get('/idle', async (req, res) => {
   const script = `
 Add-Type @"
@@ -1192,6 +1253,9 @@ async function start() {
   await sendHeartbeat();
   heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
   statsTimer = setInterval(collectStats, STATS_INTERVAL);
+  // Slower than the heartbeat on purpose: the hub restarting after a deploy is
+  // normal and must not look like an outage.
+  setInterval(() => { checkHub().catch(() => {}); }, Number(process.env.HUB_WATCHDOG_MS || 60000)).unref?.();
 
   const bothUpdateChecks = () => { checkForUpdates(); pokeHubUpdate(); };
   setTimeout(() => {
