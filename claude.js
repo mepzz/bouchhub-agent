@@ -113,6 +113,30 @@ function workBusy(name) {
   return { pid: w.pid, ageMin };
 }
 
+// Kill the process AND what it started.
+//
+// These are spawned with shell:true, so the child is cmd.exe and the CLI is its
+// grandchild. child.kill() kills the shell and leaves the CLI running — which
+// matters here more than most places, because a CLI sitting forever at an
+// interactive prompt is exactly the failure that trips the timeout. Every
+// timed-out call was leaving a live claude.exe behind, on a machine already
+// short of memory.
+function killTree(child) {
+  if (!child || child.pid == null || child.exitCode !== null) return;
+  if (process.platform === 'win32') {
+    // /t takes the children with it, /f because a process stuck on stdin will
+    // not leave politely.
+    try {
+      require('child_process').execFile('taskkill', ['/pid', String(child.pid), '/t', '/f'], () => {});
+      return;
+    } catch (_) { /* fall through to the plain kill */ }
+  } else {
+    // The shell is the group leader; the negative pid takes the group.
+    try { process.kill(-child.pid, 'SIGKILL'); return; } catch (_) { /* not a group leader */ }
+  }
+  try { child.kill('SIGKILL'); } catch (_) {}
+}
+
 function run(cmd, args, { timeoutMs = 60000, cwd, env, stdinFile } = {}) {
   return new Promise((resolve) => {
     let out = '', err = '', inFd = null;
@@ -122,11 +146,23 @@ function run(cmd, args, { timeoutMs = 60000, cwd, env, stdinFile } = {}) {
     if (stdinFile) { try { inFd = require('fs').openSync(stdinFile, 'r'); stdin = inFd; } catch (_) { stdin = 'ignore'; } }
     const child = spawn(cmd, args, {
       cwd, shell: true, windowsHide: true,
+      // POSIX only: makes the shell a process-group leader so killTree can take
+      // the whole group. Without it the group kill has nothing to aim at, the
+      // fallback kills only the shell, and the grandchild keeps the stdout pipe
+      // open — so `close` never fires and the timeout does not actually end the
+      // call. Left off on Windows, where taskkill /t handles the tree and
+      // detaching changes console behaviour for no gain.
+      detached: process.platform !== 'win32',
       env: env ? { ...process.env, ...env } : process.env,
       stdio: [stdin, 'pipe', 'pipe'],
     });
-    const finish = (code, e) => { clearTimeout(killer); if (inFd != null) { try { require('fs').closeSync(inFd); } catch (_) {} } resolve({ code, out, err: e || err }); };
-    const killer = setTimeout(() => { try { child.kill(); } catch (_) {} }, timeoutMs);
+    let timedOut = false;
+    const finish = (code, e) => {
+      clearTimeout(killer);
+      if (inFd != null) { try { require('fs').closeSync(inFd); } catch (_) {} }
+      resolve({ code, out, err: e || err, timedOut });
+    };
+    const killer = setTimeout(() => { timedOut = true; killTree(child); }, timeoutMs);
     child.stdout.on('data', d => { out += d; });
     child.stderr.on('data', d => { err += d; });
     child.on('close', (code) => finish(code));
@@ -337,6 +373,13 @@ async function complete({ provider = 'claude', prompt, timeoutMs = 180000, allow
   try {
     const r = await run(bin, args, { timeoutMs, env: providerEnv(provider), stdinFile: tmp });
     const text = (r.out || '').trim();
+    // A timeout has no exit code and no stderr, so it used to surface as
+    // "completion failed (code null): " — which says nothing about the one
+    // thing that actually happened. A CLI that produces nothing for minutes is
+    // almost always sitting at an interactive prompt.
+    if (!text && r.timedOut) {
+      throw new Error(`${provider} produced nothing in ${Math.round(timeoutMs / 1000)}s — it is most likely waiting at a prompt (login or onboarding). Run it by hand once to clear it.`);
+    }
     if (!text && r.code !== 0) throw new Error(`${provider} completion failed (code ${r.code}): ${(r.err || '').slice(0, 200)}`);
     // The CLI prints "Failed to authenticate: OAuth session expired" to STDOUT
     // and exits 1. Returning that as `text` makes it look like a model reply —
@@ -472,5 +515,5 @@ function consoleTail(arg, maybeLines) {
 module.exports = {
   status, work, complete, parseUsage, parseLimit, preflight, consoleTail,
   resolveBin, resolveClaude, PROVIDERS, logPathFor, workFolderFor, LOG_PATH,
-  authFailure,
+  authFailure, _run: run, _killTree: killTree,
 };
