@@ -46,6 +46,18 @@ async function listModels() {
   return { models: (tags.models || []).map(m => ({ name: m.name, size: m.size })) };
 }
 
+// Pull a model into Ollama. stream:false makes /api/pull return once, when the
+// download has finished (or failed), rather than streaming progress — the hub
+// wants a single "it's here" answer, not a progress bar. A big model is a long
+// download, so the timeout is generous; the caller runs this in the background.
+async function pullModel(name, { timeoutMs = 45 * 60 * 1000 } = {}) {
+  if (!name) throw new Error('no model name given to pull');
+  const r = await jsonReq(`${OLLAMA}/api/pull`, { method: 'POST', body: { name, stream: false }, timeoutMs });
+  const status = (r && r.status) || 'unknown';
+  if (String(status).toLowerCase() !== 'success') throw new Error(`pull did not finish cleanly: ${status}`);
+  return { ok: true, model: name, status };
+}
+
 async function health() {
   // Both model names come from THIS machine's .env and are reported outward,
   // so the hub never has to keep a second copy of them in sync.
@@ -343,6 +355,6 @@ async function swapFaces({ basePath, refPaths, outPath }) {
 
 module.exports = {
   health, chat, unloadText, runWorkflow, fetchOutput, uploadInput, interrupt,
-  swapFaces, stripThinking, thinkingOf, freeComfy, listModels, OUT_OF_MEMORY,
+  swapFaces, stripThinking, thinkingOf, freeComfy, listModels, pullModel, OUT_OF_MEMORY,
   OLLAMA, COMFY, TEXT_MODEL, VISION_MODEL, COMFY_HOME, COMFY_PYTHON, SWAPPER, comfyError,
 };

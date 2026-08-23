@@ -243,6 +243,16 @@ app.get('/local/models', async (req, res) => {
   catch (e) { res.status(502).json({ error: e.message }); }
 });
 
+// Install a model into Ollama on demand — the deputy uses this to bring down a
+// stronger code model for its worker. Long by nature (a multi-GB download), so
+// the hub calls it with a matching timeout and in the background.
+app.post('/local/pull', async (req, res) => {
+  const model = req.body && req.body.model;
+  if (!model) return res.status(400).json({ error: 'Missing model' });
+  try { res.json(await local.pullModel(model)); }
+  catch (e) { res.status(502).json({ error: e.message }); }
+});
+
 app.post('/local/unload', async (req, res) => {
   const what = req.body?.what || 'both';
   const out = {};
