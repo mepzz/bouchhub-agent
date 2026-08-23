@@ -238,6 +238,11 @@ app.post('/local/chat', async (req, res) => {
 // Free the machine. `both` by default, because the reason anyone presses this
 // is that something will not fit, and unloading only one side leaves the other
 // holding the memory.
+app.get('/local/models', async (req, res) => {
+  try { res.json(await local.listModels()); }
+  catch (e) { res.status(502).json({ error: e.message }); }
+});
+
 app.post('/local/unload', async (req, res) => {
   const what = req.body?.what || 'both';
   const out = {};

@@ -39,6 +39,13 @@ async function jsonReq(url, { method = 'GET', body, timeoutMs = 120000 } = {}) {
 // ── Health ───────────────────────────────────────────────────────────────────
 // Reports each service separately. Half a stack is a normal state to be in
 // while it is still being set up, and the UI needs to say which half.
+// What models Ollama has pulled — for the model picker in the UI, so it is a
+// list to choose from rather than a text box to mistype a tag into.
+async function listModels() {
+  const tags = await jsonReq(`${OLLAMA}/api/tags`, { timeoutMs: 8000 });
+  return { models: (tags.models || []).map(m => ({ name: m.name, size: m.size })) };
+}
+
 async function health() {
   // Both model names come from THIS machine's .env and are reported outward,
   // so the hub never has to keep a second copy of them in sync.
@@ -316,6 +323,6 @@ async function swapFaces({ basePath, refPaths, outPath }) {
 
 module.exports = {
   health, chat, unloadText, runWorkflow, fetchOutput, uploadInput, interrupt,
-  swapFaces, stripThinking, thinkingOf, freeComfy, OUT_OF_MEMORY,
+  swapFaces, stripThinking, thinkingOf, freeComfy, listModels, OUT_OF_MEMORY,
   OLLAMA, COMFY, TEXT_MODEL, VISION_MODEL, COMFY_HOME, COMFY_PYTHON, SWAPPER, comfyError,
 };
