@@ -650,7 +650,20 @@ app.post('/command', async (req, res) => {
   try {
     const output = await new Promise((resolve, reject) => {
       exec(command, { shell: 'powershell.exe', timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err && !stdout) return reject(err);
+        // A failed command's real cause is on stderr — "fetch is not defined",
+        // "EADDRINUSE", a stack trace. Node's own `err.message` is only
+        // "Command failed: <the whole command>", so rejecting the bare err threw
+        // the one useful part away, and every failure reached the deputy as its
+        // own command echoed back with no reason to act on. Surface stderr (or a
+        // timeout note) instead. The resolve path is unchanged, so nothing that
+        // used to count as success now counts as failure.
+        if (err && !stdout) {
+          const cause = String(stderr || '').trim();
+          const timedOut = err.killed || err.signal === 'SIGTERM';
+          return reject(new Error(
+            timedOut ? `timed out after ${Math.round(timeout / 1000)}s${cause ? ` — ${cause}` : ''}`
+                     : (cause || err.message || 'command failed')));
+        }
         resolve((stdout || '') + (stderr || ''));
       });
     });
