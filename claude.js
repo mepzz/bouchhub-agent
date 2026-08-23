@@ -56,6 +56,20 @@ const PROVIDERS = {
     flags: (auto) => `--verbose${auto ? ' --dangerously-skip-permissions' : ''}`,
   },
 };
+// The flag that gets a CLI PAST its interactive gate — the folder-trust dialog,
+// onboarding, a tool-permission prompt. Autonomous work already passes it; the
+// completion path did not, on the theory that a text completion needs no tool
+// permissions. But the gate blocks BEFORE the prompt runs, so without this the
+// deputy's escalation sat at a trust dialog for the full timeout every time the
+// CLI's trust state reset (a self-update, a new work folder). It never needed a
+// tool — it needed to not be asked.
+const BYPASS = {
+  claude: '--dangerously-skip-permissions',
+  claude2: '--dangerously-skip-permissions',
+  codex: '--dangerously-bypass-approvals-and-sandbox',
+  gemini: '--yolo',
+};
+
 function providerOf(name) { return PROVIDERS[name] || PROVIDERS.claude; }
 function providerFlags(name, auto) {
   const env = process.env[`${envKey(name)}_FLAGS`];
@@ -364,9 +378,11 @@ async function complete({ provider = 'claude', prompt, timeoutMs = 180000, allow
   const fs = require('fs');
   const tmp = path.join(os.tmpdir(), `bouchhub-complete-${provider}-${Date.now()}.txt`);
   fs.writeFileSync(tmp, prompt, 'utf8');
-  // Minimal print-mode flags per provider (no --verbose / no permission flags —
-  // a text completion uses no tools): claude/claude2 → -p, codex → exec, gemini → stdin.
-  const args = [p.subcmd, p.pipeFlag].filter(Boolean);
+  // Print-mode flags plus the bypass that keeps it non-interactive: -p / exec /
+  // stdin per provider, and the permission-skip flag so a trust or onboarding
+  // dialog can never make it hang. No --verbose — that only adds noise the
+  // reply parser has to wade through.
+  const args = [p.subcmd, p.pipeFlag, BYPASS[provider]].filter(Boolean);
   // Only the claude family takes --allowedTools; for the others the prompt has
   // to carry the content itself, so silently ignoring the hint is correct.
   if (allowTools.length && p.cli === 'claude') args.push('--allowedTools', allowTools.join(','));
