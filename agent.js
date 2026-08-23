@@ -1184,20 +1184,39 @@ async function pokeHubUpdate() {
   } catch (_) { /* hub not reachable / mid-restart — ignore */ }
 }
 
+const { updateDecision } = require('./updateDecision');
+
 async function checkForUpdates(force = false) {
   if (updateInProgress) return { status: 'already_updating' };
   try {
     await git.fetch('origin', 'main');
-    const gitStatus = await git.status();
-    if (gitStatus.behind > 0 || force) {
-      if (gitStatus.behind === 0 && force) {
-        return { status: 'up_to_date' };
+    // How many commits origin/main is ahead of our HEAD, counted against
+    // origin/main itself rather than the current branch's upstream.
+    const ahead = Number((await git.raw(['rev-list', '--count', 'HEAD..origin/main'])).trim()) || 0;
+    const decision = updateDecision(ahead, force);
+
+    if (!decision.update) {
+      if (decision.realign) {
+        // On the latest already, but make sure we are actually ON main and
+        // tracking it — a stray branch left behind is how this broke. -f resets
+        // the working tree (agent files are never hand-edited); -B moves main to
+        // origin/main and switches to it, and the stray branch's ref is kept, so
+        // none of its commits are lost.
+        await git.raw(['checkout', '-f', '-B', 'main', 'origin/main']);
+        ulog('Already up to date; realigned onto main.');
+        return { status: 'up_to_date', realigned: true };
       }
-      ulog(`Update available (${gitStatus.behind} commit(s) behind) in ${ROOT}. Pulling…`);
+      try { require('fs').appendFileSync(UPDATE_LOG, `[${new Date().toISOString()}] up to date\n`); } catch (_) {}
+      return { status: 'up_to_date' };
+    }
+
+    {
+      ulog(`Update available (${ahead} commit(s) behind origin/main) in ${ROOT}. Pulling…`);
       updateInProgress = true;
-      // Hard reset to avoid local change conflicts — agent files should never be manually edited
-      await git.fetch('origin', 'main');
-      await git.reset(['--hard', 'origin/main']);
+      // Land on main, tracking origin/main, at the latest commit — whatever
+      // branch we were on. -f discards any working-tree changes (agent files
+      // should never be manually edited); the stray branch's ref survives.
+      await git.raw(['checkout', '-f', '-B', 'main', 'origin/main']);
       // Reinstall deps, but NEVER let a dep-install hiccup block the restart —
       // the code update is what matters; deps rarely change for the agent.
       await new Promise((resolve) => {
@@ -1209,10 +1228,6 @@ async function checkForUpdates(force = false) {
       ulog('Update applied. Restarting…');
       restartSelf();
       return { status: 'updated' };
-    } else {
-      // Quiet on the console, but leave a breadcrumb so the log shows it's alive.
-      try { require('fs').appendFileSync(UPDATE_LOG, `[${new Date().toISOString()}] up to date\n`); } catch (_) {}
-      return { status: 'up_to_date' };
     }
   } catch (err) {
     updateInProgress = false;
@@ -1286,6 +1301,7 @@ start().catch(err => {
   console.error('[Agent] Fatal error:', err.message);
   process.exit(1);
 });
+
 
 
 
