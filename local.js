@@ -107,16 +107,34 @@ function reason(e) {
 // and a budget that a long prompt's thinking can exhaust produces a reply that
 // is entirely scratchpad — which strips to nothing and reads, downstream, as
 // "the model returned an empty reply".
-async function chat({ messages, model = TEXT_MODEL, temperature = 0.8, maxTokens = 4096, keepAliveS = 300 }) {
+// The context window, in tokens. This is the real ceiling — not max_tokens, but
+// how much the model can hold at once (prompt + everything it generates). The
+// OpenAI /v1 endpoint has no field for it, which is why it silently used
+// Ollama's small default and the deputy's long prompts had no room to answer.
+// The native /api/chat endpoint honours it via options, so that is what this
+// uses now.
+//
+// Bigger costs VRAM (the KV cache grows with it), so it is one knob, applied to
+// every call, tuned to the model in use: generous for an 8B with headroom,
+// smaller for a model wedged into the card. Change it in the agent .env.
+const NUM_CTX = Number(process.env.OLLAMA_NUM_CTX || 16384);
+
+async function chat({ messages, model = TEXT_MODEL, temperature = 0.8, maxTokens = 8192, keepAliveS = 300 }) {
   const body = {
-    model, messages, temperature, max_tokens: maxTokens,
-    // keep_alive controls how long the weights stay resident. Short by default
-    // so a 27B model isn't sitting on VRAM that FLUX is about to need.
+    model, messages, stream: false,
     keep_alive: `${keepAliveS}s`,
+    options: {
+      temperature,
+      num_ctx: NUM_CTX,
+      // How many tokens it may generate in one answer. -1 would let it run to
+      // the end of the window; a real number leaves room and is a safety stop.
+      num_predict: maxTokens,
+    },
   };
+  const call = () => jsonReq(`${OLLAMA}/api/chat`, { method: 'POST', body, timeoutMs: 600000 });
   let r;
   try {
-    r = await jsonReq(`${OLLAMA}/v1/chat/completions`, { method: 'POST', body, timeoutMs: 600000 });
+    r = await call();
   } catch (e) {
     // "failed to allocate" almost always means ComfyUI is still holding the
     // card and the host memory from a generation. Free it and try once more,
@@ -125,10 +143,12 @@ async function chat({ messages, model = TEXT_MODEL, temperature = 0.8, maxTokens
     if (!OUT_OF_MEMORY.test(e.message)) throw e;
     await freeComfy();
     await new Promise(res => setTimeout(res, 2000));
-    r = await jsonReq(`${OLLAMA}/v1/chat/completions`, { method: 'POST', body, timeoutMs: 600000 });
+    r = await call();
   }
-  const raw = r.choices?.[0]?.message?.content || '';
-  const finish = r.choices?.[0]?.finish_reason || null;
+  // Native shape (message.content / done_reason), with the OpenAI shape kept as
+  // a fallback so nothing that still speaks that dialect breaks.
+  const raw = r.message?.content ?? r.choices?.[0]?.message?.content ?? '';
+  const finish = r.done_reason ?? r.choices?.[0]?.finish_reason ?? null;
   let text = stripThinking(raw);
   const thinking = thinkingOf(raw);
 
@@ -149,7 +169,7 @@ async function chat({ messages, model = TEXT_MODEL, temperature = 0.8, maxTokens
     usage: r.usage || null,
     finishReason: finish,
     // Two different problems that used to look identical downstream.
-    truncated: finish === 'length',
+    truncated: finish === 'length',   // native and OpenAI both spell it this way
     answeredFromThinking: spentOnThinking || undefined,
     empty: !text ? (raw ? 'the model produced only markup' : 'the model produced no output at all') : undefined,
   };
