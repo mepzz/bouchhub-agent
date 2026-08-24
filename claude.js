@@ -243,6 +243,19 @@ async function resolveBin(name = 'claude') {
 // Back-compat alias used elsewhere/tests.
 async function resolveClaude() { return resolveBin('claude'); }
 
+// Did a run fail because the binary itself could not be launched (as opposed to
+// the CLI running and erroring)? This is the signature of a stale cached path —
+// e.g. an old npm `claude.cmd` that a native reinstall has since replaced with
+// `~\.local\bin\claude.exe`. When we see it we drop the cache and re-resolve.
+function looksLikeMissingBinary(r) {
+  if (!r) return false;
+  if ((r.out || '').trim()) return false;                 // it produced output → it ran
+  const blob = `${r.err || ''}`;
+  return /is not recognized as (?:an internal|the name)|ENOENT|cannot find (?:the )?path|no such file|command not found|系统找不到/i.test(blob);
+}
+// Forget a resolved binary so the next call searches again from scratch.
+function forgetBin(name) { delete _bins[name]; delete _search[name]; }
+
 // Parse a usage blob into { usedPct, resetsInMin } (Claude Max only).
 function parseUsage(text) {
   const t = (text || '').replace(/\[[0-9;]*m/g, '');
@@ -373,7 +386,7 @@ function excerpt(s) {
 async function complete({ provider = 'claude', prompt, timeoutMs = 180000, allowTools = [] } = {}) {
   if (!prompt) throw new Error('complete needs a prompt');
   const p = providerOf(provider);
-  const bin = _bins[provider] || (await resolveBin(provider)) || process.env[p.binEnv] || p.cli;
+  let bin = _bins[provider] || (await resolveBin(provider)) || process.env[p.binEnv] || p.cli;
   if (!bin) throw new Error(`${provider} CLI not found on this PC`);
   const fs = require('fs');
   const tmp = path.join(os.tmpdir(), `bouchhub-complete-${provider}-${Date.now()}.txt`);
@@ -387,7 +400,19 @@ async function complete({ provider = 'claude', prompt, timeoutMs = 180000, allow
   // to carry the content itself, so silently ignoring the hint is correct.
   if (allowTools.length && p.cli === 'claude') args.push('--allowedTools', allowTools.join(','));
   try {
-    const r = await run(bin, args, { timeoutMs, env: providerEnv(provider), stdinFile: tmp });
+    let r = await run(bin, args, { timeoutMs, env: providerEnv(provider), stdinFile: tmp });
+    // A cached path that no longer launches (stale npm .cmd after a native
+    // reinstall) would fail every call forever. Drop it, search again, and if a
+    // different install turns up, run that one — the agent heals itself onto the
+    // CLI that is actually on the box without needing a restart.
+    if (looksLikeMissingBinary(r)) {
+      forgetBin(provider);
+      const fresh = (await resolveBin(provider)) || process.env[p.binEnv] || p.cli;
+      if (fresh && fresh !== bin) {
+        bin = fresh;
+        r = await run(bin, args, { timeoutMs, env: providerEnv(provider), stdinFile: tmp });
+      }
+    }
     const text = (r.out || '').trim();
     // A timeout has no exit code and no stderr, so it used to surface as
     // "completion failed (code null): " — which says nothing about the one
