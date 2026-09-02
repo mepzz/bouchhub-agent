@@ -55,6 +55,16 @@ const PROVIDERS = {
     subcmd: '', promptVia: 'stdin', pipeFlag: '-p', usageGate: true,
     flags: (auto) => `--verbose${auto ? ' --dangerously-skip-permissions' : ''}`,
   },
+  // The Creature Studio's Lead: the same Claude CLI and (by default) the same
+  // org as `claude`, but its OWN provider so it gets its own single-session
+  // lock — the Lead reviews while a worker builds — and its own clone. The hub
+  // picks its model per launch (work({ model })); nothing is pinned here.
+  // LEAD_CONFIG_DIR may point it at another org, like claude2.
+  lead: {
+    cli: 'claude', binEnv: 'LEAD_BIN', defaultFolder: 'PartyGame-Lead',
+    subcmd: '', promptVia: 'stdin', pipeFlag: '-p', usageGate: true,
+    flags: (auto) => `--verbose${auto ? ' --dangerously-skip-permissions' : ''}`,
+  },
 };
 // The flag that gets a CLI PAST its interactive gate — the folder-trust dialog,
 // onboarding, a tool-permission prompt. Autonomous work already passes it; the
@@ -66,14 +76,25 @@ const PROVIDERS = {
 const BYPASS = {
   claude: '--dangerously-skip-permissions',
   claude2: '--dangerously-skip-permissions',
+  lead: '--dangerously-skip-permissions',
   codex: '--dangerously-bypass-approvals-and-sandbox',
   gemini: '--yolo',
 };
 
 function providerOf(name) { return PROVIDERS[name] || PROVIDERS.claude; }
-function providerFlags(name, auto) {
+function providerFlags(name, auto, model) {
   const env = process.env[`${envKey(name)}_FLAGS`];
-  return env != null ? env : providerOf(name).flags(auto);
+  const base = env != null ? env : providerOf(name).flags(auto);
+  const m = modelFlag(name, model);
+  return m ? `${base} ${m}`.trim() : base;
+}
+// `--model <alias>` for the Claude CLI only (codex/gemini pick models their own
+// way). The value is reduced to [A-Za-z0-9._-]: it lands on a PowerShell
+// command line, so anything else is dropped rather than quoted.
+function modelFlag(name, model) {
+  if (!model || providerOf(name).cli !== 'claude') return '';
+  const clean = String(model).replace(/[^A-Za-z0-9._-]/g, '');
+  return clean ? `--model ${clean}` : '';
 }
 // Env-var-safe upper-case key for a provider name (hyphens → underscores).
 function envKey(name) { return String(name).toUpperCase().replace(/[^A-Z0-9]/g, '_'); }
@@ -433,7 +454,7 @@ async function complete({ provider = 'claude', prompt, timeoutMs = 180000, allow
 
 // Launch an autonomous session for `provider`, hidden in the background, teeing
 // output to the provider's log. Auto-accepts permissions when asked.
-function work({ provider = 'claude', prompt, cwd, autoAccept = true } = {}) {
+function work({ provider = 'claude', prompt, cwd, autoAccept = true, model } = {}) {
   if (!prompt) throw new Error('work needs a prompt');
   if (!PROVIDERS[provider]) throw new Error(`unknown provider: ${provider}`);
   const fs = require('fs');
@@ -451,7 +472,7 @@ function work({ provider = 'claude', prompt, cwd, autoAccept = true } = {}) {
     ? (path.isAbsolute(cwd) ? cwd : path.join(os.homedir(), cwd))
     : workFolderFor(provider);
 
-  const flags = providerFlags(provider, autoAccept);
+  const flags = providerFlags(provider, autoAccept, model);
   const promptFile = path.join(os.tmpdir(), `bouchhub-handoff-${provider}-${Date.now()}.txt`);
   fs.writeFileSync(promptFile, prompt, 'utf8');
   try { fs.appendFileSync(LOG, `\n===== BouchHub ${provider} session started (${new Date().toISOString()}) =====\n`); } catch (_) {}
@@ -556,5 +577,5 @@ function consoleTail(arg, maybeLines) {
 module.exports = {
   status, work, complete, parseUsage, parseLimit, preflight, consoleTail,
   resolveBin, resolveClaude, PROVIDERS, logPathFor, workFolderFor, LOG_PATH,
-  authFailure, _run: run, _killTree: killTree,
+  authFailure, _run: run, _killTree: killTree, _modelFlag: modelFlag, _providerFlags: providerFlags,
 };

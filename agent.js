@@ -770,9 +770,9 @@ app.post('/claude/status', async (req, res) => {
 // handoff prompt, auto-accepting permissions, in the given folder.
 app.post('/claude/work', async (req, res) => {
   if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });
-  const { prompt, cwd, autoAccept, provider } = req.body || {};
+  const { prompt, cwd, autoAccept, provider, model } = req.body || {};
   if (!prompt) return res.status(400).json({ error: 'prompt required' });
-  try { res.json(claudeModule.work({ provider: provider || 'claude', prompt, cwd, autoAccept: autoAccept !== false })); }
+  try { res.json(claudeModule.work({ provider: provider || 'claude', prompt, cwd, autoAccept: autoAccept !== false, model })); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
