@@ -38,12 +38,14 @@ const PROVIDERS = {
     cli: 'codex', binEnv: 'CODEX_BIN', defaultFolder: 'BouchHub-Codex',
     subcmd: 'exec', promptVia: 'stdin', pipeFlag: '', usageGate: false,
     flags: (auto) => (auto ? '--dangerously-bypass-approvals-and-sandbox' : ''),
+    modelOpt: '--model',
   },
   gemini: {
     // Gemini's non-interactive mode reads piped stdin directly (no flag needed).
     cli: 'gemini', binEnv: 'GEMINI_BIN', defaultFolder: 'BouchHub-Gemini',
     subcmd: '', promptVia: 'stdin', pipeFlag: '', usageGate: false,
     flags: (auto) => (auto ? '--yolo' : ''),
+    modelOpt: '-m',
   },
   // A second Claude ORG under the same login. The CLI has no org flag, so we pin
   // this provider to the other org by running the same `claude` binary with
@@ -88,13 +90,25 @@ function providerFlags(name, auto, model) {
   const m = modelFlag(name, model);
   return m ? `${base} ${m}`.trim() : base;
 }
-// `--model <alias>` for the Claude CLI only (codex/gemini pick models their own
-// way). The value is reduced to [A-Za-z0-9._-]: it lands on a PowerShell
-// command line, so anything else is dropped rather than quoted.
+// The per-launch model, spelled the way each CLI spells it. This used to be
+// Claude-only on the theory that "codex/gemini pick models their own way" —
+// they do not. The hub stored gpt-6-astra, logged "session started
+// [gpt-6-astra]", dropped the flag here, and codex ran its own default. An
+// agent on the wrong model looks identical to one on the right model, so a
+// setting that is silently ignored is worse than no setting at all.
+//
+// The value is reduced to [A-Za-z0-9._-]: it lands on a PowerShell command
+// line, so anything else is dropped rather than quoted.
+function modelOptFor(name) {
+  const p = providerOf(name);
+  return p.modelOpt || (p.cli === 'claude' ? '--model' : '');
+}
 function modelFlag(name, model) {
-  if (!model || providerOf(name).cli !== 'claude') return '';
+  if (!model) return '';
+  const opt = modelOptFor(name);
+  if (!opt) return '';
   const clean = String(model).replace(/[^A-Za-z0-9._-]/g, '');
-  return clean ? `--model ${clean}` : '';
+  return clean ? `${opt} ${clean}` : '';
 }
 // Env-var-safe upper-case key for a provider name (hyphens → underscores).
 function envKey(name) { return String(name).toUpperCase().replace(/[^A-Z0-9]/g, '_'); }
@@ -577,5 +591,5 @@ function consoleTail(arg, maybeLines) {
 module.exports = {
   status, work, complete, parseUsage, parseLimit, preflight, consoleTail,
   resolveBin, resolveClaude, PROVIDERS, logPathFor, workFolderFor, LOG_PATH,
-  authFailure, _run: run, _killTree: killTree, _modelFlag: modelFlag, _providerFlags: providerFlags,
+  authFailure, _run: run, _killTree: killTree, _modelFlag: modelFlag, _modelOptFor: modelOptFor, _providerFlags: providerFlags,
 };
