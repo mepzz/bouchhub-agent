@@ -786,6 +786,16 @@ app.post('/claude/complete', async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Voice question: streamed `claude -p` (stream-json → NDJSON) with the hub's
+// tools over MCP. The hub's voice assistant is the only caller.
+app.post('/claude/voice', async (req, res) => {
+  if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });
+  const body = req.body || {};
+  if (!body.prompt) return res.status(400).json({ error: 'prompt required' });
+  try { await claudeModule.voice({ ...body, provider: body.provider || 'claude' }, res); }
+  catch (e) { if (!res.headersSent) res.status(500).json({ error: e.message }); else { try { res.end(); } catch (_) {} } }
+});
+
 // Pre-flight: report whether a provider's CLI + its work folder are present.
 app.post('/claude/preflight', async (req, res) => {
   if (!claudeModule) return res.status(503).json({ error: 'claude module unavailable' });

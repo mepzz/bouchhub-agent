@@ -588,8 +588,121 @@ function consoleTail(arg, maybeLines) {
   } catch (e) { return { provider, lines: [], note: e.message }; }
 }
 
+
+// ── Voice: streamed `claude -p` with the hub's tools over MCP ────────────────
+// The hub's voice assistant asks questions here. Unlike complete(), the reply
+// is streamed: the CLI's --output-format stream-json lines go straight to the
+// HTTP response as they appear, so the hub can hand each finished sentence to
+// the TTS while the rest is still being written. Hub tools reach the CLI over
+// MCP (an http server on the hub, config written to a temp file), the spoken
+// style comes from a system prompt file, and a session id can be resumed for
+// follow-up questions. Runs on the subscription like everything else here
+// (providerEnv blanks any API key).
+//
+// A voice question must never queue behind a running autopilot session, so
+// it has its own small concurrency cap instead of the work() lock.
+const VOICE_MAX_CONCURRENT = 2;
+const _voiceRuns = {}; // provider → running count
+const VOICE_DEFAULT_TOOLS = ['mcp__bouch__*', 'WebSearch'];
+
+function voiceWorkFolder() {
+  // A stable, empty project folder: `--resume` finds sessions per cwd, and a
+  // real project's CLAUDE.md/hooks must not leak into a spoken reply.
+  const dir = process.env.VOICE_WORK_FOLDER || path.join(os.homedir(), 'Downloads', 'BouchHub-Voice');
+  try { require('fs').mkdirSync(dir, { recursive: true }); } catch (_) {}
+  return dir;
+}
+
+// Double quotes survive both cmd.exe and sh, and keep `mcp__bouch__*` from
+// being globbed on POSIX. Values are restricted so a quote can never escape.
+function q(v) { return `"${String(v).replace(/["\r\n]/g, '')}"`; }
+
+function buildVoiceArgs({ provider = 'claude', model, mcpPath, systemPromptPath, allowedTools = VOICE_DEFAULT_TOOLS, resumeSessionId } = {}) {
+  const p = providerOf(provider);
+  const args = [p.subcmd, '-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
+  const mf = modelFlag(provider, model);
+  if (mf) args.push(mf);
+  if (mcpPath) args.push('--mcp-config', q(mcpPath), '--strict-mcp-config');
+  const tools = (Array.isArray(allowedTools) ? allowedTools : VOICE_DEFAULT_TOOLS).filter(t => /^[A-Za-z0-9_*:.-]+$/.test(String(t)));
+  if (tools.length) args.push('--allowedTools', ...tools.map(q));
+  if (systemPromptPath) args.push('--append-system-prompt-file', q(systemPromptPath));
+  if (resumeSessionId && /^[A-Za-z0-9-]+$/.test(String(resumeSessionId))) args.push('--resume', String(resumeSessionId));
+  if (BYPASS[provider]) args.push(BYPASS[provider]);
+  return args.filter(Boolean);
+}
+
+// Streams NDJSON to `res` (an http.ServerResponse or anything with
+// writeHead/write/end/on). Resolves when the child is done.
+async function voice({ provider = 'claude', prompt, model, systemPrompt = '', mcpUrl, mcpToken, allowedTools, resumeSessionId, timeoutMs = 30000, bin } = {}, res) {
+  if (!prompt) throw new Error('voice needs a prompt');
+  const fs = require('fs');
+  const p = providerOf(provider);
+  const exe = bin || _bins[provider] || (await resolveBin(provider)) || process.env[p.binEnv] || p.cli;
+  if (!exe) throw new Error(`${provider} CLI not found on this PC`);
+  if ((_voiceRuns[provider] || 0) >= VOICE_MAX_CONCURRENT) throw new Error(`${provider} is already answering ${VOICE_MAX_CONCURRENT} voice questions`);
+
+  const stamp = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  const promptFile = path.join(os.tmpdir(), `bouchhub-voice-prompt-${stamp}.txt`);
+  const sysFile = systemPrompt ? path.join(os.tmpdir(), `bouchhub-voice-system-${stamp}.md`) : null;
+  const mcpFile = mcpUrl ? path.join(os.tmpdir(), `bouchhub-voice-mcp-${stamp}.json`) : null;
+  fs.writeFileSync(promptFile, String(prompt), 'utf8');
+  if (sysFile) fs.writeFileSync(sysFile, String(systemPrompt), 'utf8');
+  if (mcpFile) fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers: { bouch: { type: 'http', url: mcpUrl, headers: mcpToken ? { 'x-voice-mcp-token': mcpToken } : {} } } }), 'utf8');
+
+  const args = buildVoiceArgs({ provider, model, mcpPath: mcpFile, systemPromptPath: sysFile, allowedTools, resumeSessionId });
+  _voiceRuns[provider] = (_voiceRuns[provider] || 0) + 1;
+
+  let inFd = null;
+  try { inFd = fs.openSync(promptFile, 'r'); } catch (_) {}
+  const send = (obj) => { try { res.write(JSON.stringify(obj) + '\n'); } catch (_) {} };
+  const cleanup = () => {
+    if (inFd != null) { try { fs.closeSync(inFd); } catch (_) {} inFd = null; }
+    for (const f of [promptFile, sysFile, mcpFile]) if (f) { try { fs.unlinkSync(f); } catch (_) {} }
+  };
+
+  return new Promise((resolve) => {
+    let stderr = '', buf = '', timedOut = false, finished = false;
+    const child = spawn(exe, args, {
+      cwd: voiceWorkFolder(), shell: true, windowsHide: true,
+      detached: process.platform !== 'win32',
+      env: { ...process.env, ...providerEnv(provider) },
+      stdio: [inFd == null ? 'ignore' : inFd, 'pipe', 'pipe'],
+    });
+    const finish = (code, err) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(killer);
+      _voiceRuns[provider] = Math.max(0, (_voiceRuns[provider] || 1) - 1);
+      cleanup();
+      if (buf.trim()) forwardLine(buf);
+      send({ type: 'agent_done', code, timedOut, stderr: (err || stderr).slice(-400) });
+      try { res.end(); } catch (_) {}
+      resolve({ code, timedOut });
+    };
+    const forwardLine = (line) => {
+      const t = line.replace(/\r$/, '');
+      if (!t.trim()) return;
+      try { JSON.parse(t); res.write(t + '\n'); }
+      catch (_) { send({ type: 'raw', line: t.slice(0, 2000) }); }
+    };
+    const killer = setTimeout(() => { timedOut = true; killTree(child); }, timeoutMs);
+    try { res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' }); } catch (_) {}
+    // The hub hangs up on barge-in or its own timeout: stop the CLI too.
+    if (typeof res.on === 'function') res.on('close', () => { if (!finished) { killTree(child); } });
+    child.stdout.on('data', (d) => {
+      buf += d;
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) { forwardLine(buf.slice(0, nl)); buf = buf.slice(nl + 1); }
+    });
+    child.stderr.on('data', (d) => { stderr += d; if (stderr.length > 8000) stderr = stderr.slice(-4000); });
+    child.on('close', (code) => finish(code));
+    child.on('error', (e) => finish(-1, e.message));
+  });
+}
+
 module.exports = {
   status, work, complete, parseUsage, parseLimit, preflight, consoleTail,
   resolveBin, resolveClaude, PROVIDERS, logPathFor, workFolderFor, LOG_PATH,
+  voice, buildVoiceArgs, voiceWorkFolder, VOICE_DEFAULT_TOOLS,
   authFailure, _run: run, _killTree: killTree, _modelFlag: modelFlag, _modelOptFor: modelOptFor, _providerFlags: providerFlags,
 };
