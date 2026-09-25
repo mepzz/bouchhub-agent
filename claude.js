@@ -605,6 +605,31 @@ const VOICE_MAX_CONCURRENT = 2;
 const _voiceRuns = {}; // provider → running count
 const VOICE_DEFAULT_TOOLS = ['mcp__bouch__*', 'WebSearch'];
 
+// The hub writes its MCP url as http://127.0.0.1:<port>/… — right when this
+// agent runs on the hub's PC, wrong when it runs elsewhere (the CLI would
+// knock on its own localhost and get no tools). We reach the hub at HUB_URL,
+// so a loopback host is re-based onto HUB_URL's host when the hub is not this
+// machine; the path (with the session token) and the port of the hub stay.
+function ownAddresses() {
+  const set = new Set(['127.0.0.1', '::1', 'localhost']);
+  try { for (const list of Object.values(os.networkInterfaces())) for (const n of list || []) if (n && n.address) set.add(String(n.address).replace(/%.*$/, '')); } catch (_) {}
+  return set;
+}
+function mcpUrlFor(mcpUrl, hubUrl = process.env.HUB_URL, own = ownAddresses()) {
+  if (!mcpUrl || !hubUrl) return mcpUrl;
+  let m, h;
+  try { m = new URL(mcpUrl); h = new URL(hubUrl); } catch (_) { return mcpUrl; }
+  const loop = ['127.0.0.1', '::1', '[::1]', 'localhost'];
+  if (!loop.includes(m.hostname)) return mcpUrl;                 // the hub already gave a reachable host
+  const hubHost = h.hostname.replace(/^\[|\]$/g, '');
+  if (loop.includes(h.hostname) || own.has(hubHost)) return mcpUrl;  // the hub is this machine
+  m.hostname = h.hostname;
+  if (h.port) m.port = h.port;                                    // the hub's real port (a reverse proxy may differ from 3000)
+  else if (h.protocol === 'https:') m.port = '';
+  m.protocol = h.protocol;
+  return m.toString();
+}
+
 function voiceWorkFolder() {
   // A stable, empty project folder: `--resume` finds sessions per cwd, and a
   // real project's CLAUDE.md/hooks must not leak into a spoken reply.
@@ -647,7 +672,7 @@ async function voice({ provider = 'claude', prompt, model, systemPrompt = '', mc
   const mcpFile = mcpUrl ? path.join(os.tmpdir(), `bouchhub-voice-mcp-${stamp}.json`) : null;
   fs.writeFileSync(promptFile, String(prompt), 'utf8');
   if (sysFile) fs.writeFileSync(sysFile, String(systemPrompt), 'utf8');
-  if (mcpFile) fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers: { bouch: { type: 'http', url: mcpUrl, headers: mcpToken ? { 'x-voice-mcp-token': mcpToken } : {} } } }), 'utf8');
+  if (mcpFile) fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers: { bouch: { type: 'http', url: mcpUrlFor(mcpUrl), headers: mcpToken ? { 'x-voice-mcp-token': mcpToken } : {} } } }), 'utf8');
 
   const args = buildVoiceArgs({ provider, model, mcpPath: mcpFile, systemPromptPath: sysFile, allowedTools, resumeSessionId });
   _voiceRuns[provider] = (_voiceRuns[provider] || 0) + 1;
@@ -703,6 +728,6 @@ async function voice({ provider = 'claude', prompt, model, systemPrompt = '', mc
 module.exports = {
   status, work, complete, parseUsage, parseLimit, preflight, consoleTail,
   resolveBin, resolveClaude, PROVIDERS, logPathFor, workFolderFor, LOG_PATH,
-  voice, buildVoiceArgs, voiceWorkFolder, VOICE_DEFAULT_TOOLS,
+  voice, buildVoiceArgs, voiceWorkFolder, mcpUrlFor, VOICE_DEFAULT_TOOLS,
   authFailure, _run: run, _killTree: killTree, _modelFlag: modelFlag, _modelOptFor: modelOptFor, _providerFlags: providerFlags,
 };

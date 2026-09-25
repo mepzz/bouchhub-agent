@@ -52,6 +52,19 @@ function fakeRes() {
     assert.ok(!claude.buildVoiceArgs({ provider: 'claude', allowedTools: ['ok_tool', 'bad tool"'] }).join(' ').includes('bad'), 'unsafe tool patterns are dropped');
   });
 
+  await test('mcpUrlFor: a loopback MCP url is re-based onto the hub host only when the hub is another machine', () => {
+    const own = new Set(['127.0.0.1', '::1', 'localhost', '192.168.2.36', '100.64.0.5']);
+    const url = 'http://127.0.0.1:3000/mcp/voice/tok';
+    assert.strictEqual(claude.mcpUrlFor(url, 'http://localhost:3000', own), url, 'hub at localhost → this machine');
+    assert.strictEqual(claude.mcpUrlFor(url, 'http://192.168.2.36:3000', own), url, 'hub at one of our own addresses → this machine');
+    assert.strictEqual(claude.mcpUrlFor(url, 'http://192.168.2.10:3000', own), 'http://192.168.2.10:3000/mcp/voice/tok', 'hub elsewhere on the LAN');
+    assert.strictEqual(claude.mcpUrlFor(url, 'http://bigpapa.tail1234.ts.net:8080', own), 'http://bigpapa.tail1234.ts.net:8080/mcp/voice/tok', 'the hub\'s real port wins');
+    assert.strictEqual(claude.mcpUrlFor(url, 'https://hub.example.com', own), 'https://hub.example.com/mcp/voice/tok', 'https through a proxy: no port');
+    assert.strictEqual(claude.mcpUrlFor('http://10.0.0.4:3000/mcp/voice/tok', 'http://192.168.2.10:3000', own), 'http://10.0.0.4:3000/mcp/voice/tok', 'a non-loopback url is left alone');
+    assert.strictEqual(claude.mcpUrlFor(url, undefined, own), url, 'no HUB_URL → unchanged');
+    assert.strictEqual(claude.mcpUrlFor('not a url', 'http://x', own), 'not a url');
+  });
+
   await test('voice() streams the CLI output as NDJSON, wraps non-JSON lines, and appends agent_done', async () => {
     const res = fakeRes();
     const r = await claude.voice({ provider: 'claude', prompt: 'what is playing', model: 'haiku', systemPrompt: 'speak short', mcpUrl: 'http://127.0.0.1:3000/mcp/voice/tok', mcpToken: 'tok', timeoutMs: 5000, bin: `sh ${FAKE}` }, res);
