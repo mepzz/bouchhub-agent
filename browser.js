@@ -175,9 +175,15 @@ function buildSearchUrl(platform, query, opts = {}) {
     case 'kijiji':
       // Kijiji Canada full-text search, sorted by date (newest).
       return `https://www.kijiji.ca/b-buy-sell/canada/${q}/k0c10l0?sort=dateDesc${max ? `&price=__${max}` : ''}`;
-    case 'ebay':
-      // eBay.ca, Buy-It-Now-ish, sorted newest (_sop=10), CAD site.
-      return `https://www.ebay.ca/sch/i.html?_nkw=${q}&_sop=10${max ? `&_udhi=${max}` : ''}`;
+    case 'ebay': {
+      // eBay.ca, sorted newest (_sop=10), CAD site. opts.sold = completed +
+      // sold items only, most recent sale first (_sop=13) — the hub's "what
+      // did this actually sell for" comps. opts.minPrice weeds out lots of
+      // commons when hunting one card.
+      const min = opts.minPrice ? Math.floor(opts.minPrice) : null;
+      const sold = opts.sold ? '&LH_Sold=1&LH_Complete=1&_sop=13' : '&_sop=10';
+      return `https://www.ebay.ca/sch/i.html?_nkw=${q}${sold}${max ? `&_udhi=${max}` : ''}${min ? `&_udlo=${min}` : ''}${opts.buyItNow ? '&LH_BIN=1' : ''}`;
+    }
     // ── Retail / online stores (new + open-box) ──
     case 'amazon':          return `https://www.amazon.ca/s?k=${q}`;
     case 'bestbuy':         return `https://www.bestbuy.ca/en-ca/search?search=${q}`;
@@ -305,7 +311,17 @@ async function marketplaceSearch(platform, query, opts = {}) {
         if (!title || /shop on ebay/i.test(title)) continue;
         const img = li.querySelector('img');
         seen.add(id);
-        out.push({ id: 'eb_' + id, title, price: priceFrom(li.querySelector('.s-item__price')?.innerText || li.innerText), url: 'https://www.ebay.ca/itm/' + id, image: img ? (img.src || img.getAttribute('data-src')) : null, location: null });
+        // A sold listing shows when it sold ("Sold Sep 20, 2026") and whether
+        // it went by auction or best offer; a live one its format and shipping.
+        const tag = clean(li.querySelector('.s-item__title--tagblock, .s-item__ended-date, .s-item__caption, .s-item__title-tag')?.innerText) || null;
+        const soldAt = tag && /sold/i.test(tag) ? tag.replace(/^sold\s*/i, '').trim() : null;
+        const text = clean(li.innerText);
+        out.push({
+          id: 'eb_' + id, title, price: priceFrom(li.querySelector('.s-item__price')?.innerText || li.innerText),
+          url: 'https://www.ebay.ca/itm/' + id, image: img ? (img.src || img.getAttribute('data-src')) : null, location: null,
+          soldAt, bestOffer: /best offer accepted/i.test(text), auction: /\bbids?\b/i.test(text) && !/buy it now/i.test(text),
+          shipping: (text.match(/(\$[\d,]+(?:\.\d{2})?\s*shipping|free shipping)/i) || [null])[0],
+        });
       }
     }
     return out.slice(0, 40);
