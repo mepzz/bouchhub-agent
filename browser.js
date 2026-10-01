@@ -316,10 +316,17 @@ async function marketplaceSearch(platform, query, opts = {}) {
         const tag = clean(li.querySelector('.s-item__title--tagblock, .s-item__ended-date, .s-item__caption, .s-item__title-tag')?.innerText) || null;
         const soldAt = tag && /sold/i.test(tag) ? tag.replace(/^sold\s*/i, '').trim() : null;
         const text = clean(li.innerText);
+        // Auctions: "6d 3h left" / "2h 15m left" and the bid count; a fixed
+        // price shows "Buy It Now" / "or Best Offer" instead.
+        const timeLeft = clean(li.querySelector('.s-item__time-left, .s-item__time-end')?.innerText) || (text.match(/\b(\d+d\s*\d*h?|\d+h\s*\d*m?|\d+m\s*\d*s?)\s*left\b/i) || [null])[0] || null;
+        const bidsText = clean(li.querySelector('.s-item__bids, .s-item__bidCount')?.innerText) || (text.match(/\b(\d+)\s*bids?\b/i) || [null])[0];
+        const bids = bidsText ? parseInt(bidsText, 10) : null;
         out.push({
           id: 'eb_' + id, title, price: priceFrom(li.querySelector('.s-item__price')?.innerText || li.innerText),
           url: 'https://www.ebay.ca/itm/' + id, image: img ? (img.src || img.getAttribute('data-src')) : null, location: null,
-          soldAt, bestOffer: /best offer accepted/i.test(text), auction: /\bbids?\b/i.test(text) && !/buy it now/i.test(text),
+          soldAt, bestOffer: /best offer/i.test(text), buyItNow: /buy it now/i.test(text),
+          auction: !!timeLeft || (bids != null && !/buy it now/i.test(text)),
+          timeLeft: timeLeft ? timeLeft.replace(/\s*left\s*$/i, '').trim() : null, bids,
           shipping: (text.match(/(\$[\d,]+(?:\.\d{2})?\s*shipping|free shipping)/i) || [null])[0],
         });
       }
