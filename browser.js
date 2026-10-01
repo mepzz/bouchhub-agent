@@ -12,18 +12,33 @@ const BOUCHHUB_PROFILE = path.join(os.homedir(), 'AppData', 'Local', 'BouchHubPr
 let activeBrowser = null;
 let activePage = null;
 
-// ─── Find Chrome ───────────────────────────────────────────
-function findChrome() {
-  const candidates = [
-    path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-  ];
-  for (const c of candidates) {
-    try { fs.accessSync(c); return c; } catch (_) {}
+// ─── Find a Chromium browser ───────────────────────────────
+// Chrome, Brave or Edge: all three are Chromium and take the same
+// remote-debugging flags, so whichever is installed drives the searches.
+// BROWSER_PATH in the agent's .env pins one. `userData` is where that
+// browser keeps the user's real profile (its cookies are copied so the
+// BouchHub window is already logged in).
+const LOCAL = path.join(os.homedir(), 'AppData', 'Local');
+const BROWSERS = [
+  { name: 'Chrome', exe: [path.join(LOCAL, 'Google', 'Chrome', 'Application', 'chrome.exe'), 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe'], userData: path.join(LOCAL, 'Google', 'Chrome', 'User Data') },
+  { name: 'Brave', exe: [path.join(LOCAL, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'), 'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe', 'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe'], userData: path.join(LOCAL, 'BraveSoftware', 'Brave-Browser', 'User Data') },
+  { name: 'Edge', exe: [path.join(LOCAL, 'Microsoft', 'Edge', 'Application', 'msedge.exe'), 'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe', 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'], userData: path.join(LOCAL, 'Microsoft', 'Edge', 'User Data') },
+];
+function findBrowser() {
+  const pinned = process.env.BROWSER_PATH;
+  if (pinned) {
+    try { fs.accessSync(pinned); } catch (_) { throw new Error(`BROWSER_PATH points at ${pinned} but nothing is there`); }
+    const known = BROWSERS.find((b) => b.exe.some((e) => e.toLowerCase() === pinned.toLowerCase()) || new RegExp(b.name, 'i').test(pinned));
+    return { name: known ? known.name : 'browser', path: pinned, userData: known ? known.userData : null };
+  }
+  for (const b of BROWSERS) {
+    for (const exe of b.exe) {
+      try { fs.accessSync(exe); return { name: b.name, path: exe, userData: b.userData }; } catch (_) {}
+    }
   }
   return null;
 }
+function findChrome() { const b = findBrowser(); return b ? b.path : null; }   // back-compat
 
 // ─── Check debug port ──────────────────────────────────────
 async function isDebugPortOpen() {
@@ -36,8 +51,8 @@ async function isDebugPortOpen() {
 
 // ─── Sync cookies from real Chrome profile ────────────────
 // Copies only the login/session files, not the full profile (which is huge)
-function syncProfileFromChrome() {
-  const realProfile = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data', 'Default');
+function syncProfileFromChrome(userData) {
+  const realProfile = path.join(userData || path.join(LOCAL, 'Google', 'Chrome', 'User Data'), 'Default');
   const bouchhubDefault = path.join(BOUCHHUB_PROFILE, 'Default');
 
   if (!fs.existsSync(BOUCHHUB_PROFILE)) {
@@ -72,11 +87,12 @@ async function launchBrowser() {
     console.log('[Browser] Reconnecting to existing BouchHub Chrome window');
     activeBrowser = await chromium.connectOverCDP(`http://127.0.0.1:${DEBUG_PORT}`, { timeout: 5000 });
   } else {
-    const chromePath = findChrome();
-    if (!chromePath) throw new Error('Chrome not found. Please install Google Chrome.');
+    const browser = findBrowser();
+    if (!browser) throw new Error('No Chromium browser found (looked for Chrome, Brave and Edge in the usual places). Install one, or set BROWSER_PATH in the agent .env to its exe.');
+    const chromePath = browser.path;
 
-    // Sync cookies from real profile so we're already logged in
-    syncProfileFromChrome();
+    // Sync cookies from the real profile so we're already logged in
+    if (browser.userData) syncProfileFromChrome(browser.userData);
 
     const args = [
       `--remote-debugging-port=${DEBUG_PORT}`,
@@ -90,14 +106,14 @@ async function launchBrowser() {
       '--disable-blink-features=AutomationControlled',
     ].join(' ');
 
-    console.log('[Browser] Opening BouchHub Chrome window (minimized, separate from your tabs)...');
+    console.log(`[Browser] Opening BouchHub ${browser.name} window (minimized, separate from your tabs): ${chromePath}`);
     exec(`"${chromePath}" ${args}`);
 
     // Wait for debug port to be ready
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 1000));
       if (await isDebugPortOpen()) {
-        console.log('[Browser] BouchHub Chrome ready');
+        console.log(`[Browser] BouchHub ${browser.name} ready`);
         break;
       }
       if (i === 19) throw new Error('Chrome opened but debug port never became available.');
@@ -562,7 +578,7 @@ async function screenshot() {
 module.exports = {
   launchBrowser, closeBrowser, navigate,
   instagramLogin, instagramSendDM,
-  marketplaceSearch, extractPage, buildSearchUrl,
+  marketplaceSearch, extractPage, buildSearchUrl, findBrowser, BROWSERS,
   getPageInfo, screenshot,
   isOpen: () => !!activeBrowser,
 };
