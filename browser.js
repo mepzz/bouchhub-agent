@@ -196,9 +196,13 @@ function buildSearchUrl(platform, query, opts = {}) {
       // sold items only, most recent sale first (_sop=13) — the hub's "what
       // did this actually sell for" comps. opts.minPrice weeds out lots of
       // commons when hunting one card.
+      // opts.perPage (60 | 120 | 240) and opts.page let the hub sweep a whole
+      // search ("every live Senators Future Watch auto"), not just the newest 40.
       const min = opts.minPrice ? Math.floor(opts.minPrice) : null;
       const sold = opts.sold ? '&LH_Sold=1&LH_Complete=1&_sop=13' : '&_sop=10';
-      return `https://www.ebay.ca/sch/i.html?_nkw=${q}${sold}${max ? `&_udhi=${max}` : ''}${min ? `&_udlo=${min}` : ''}${opts.buyItNow ? '&LH_BIN=1' : ''}`;
+      const perPage = [60, 120, 240].includes(Number(opts.perPage)) ? Number(opts.perPage) : null;
+      const pageNo = Number(opts.page) > 1 ? Math.floor(Number(opts.page)) : null;
+      return `https://www.ebay.ca/sch/i.html?_nkw=${q}${sold}${max ? `&_udhi=${max}` : ''}${min ? `&_udlo=${min}` : ''}${opts.buyItNow ? '&LH_BIN=1' : ''}${perPage ? `&_ipg=${perPage}` : ''}${pageNo ? `&_pgn=${pageNo}` : ''}`;
     }
     // ── Retail / online stores (new + open-box) ──
     case 'amazon':          return `https://www.amazon.ca/s?k=${q}`;
@@ -230,7 +234,9 @@ async function marketplaceSearch(platform, query, opts = {}) {
   try { await page.mouse.wheel(0, 2400); await page.waitForTimeout(1500); } catch (_) {}
 
   const isRetail = RETAIL_PLATFORMS.includes(platform);
-  const items = await page.evaluate(({ platform, isRetail }) => {
+  // opts.limit caps the items returned (default 40, up to 240 for a sweep).
+  const limit = Math.max(1, Math.min(240, Number(opts.limit) || 40));
+  const items = await page.evaluate(({ platform, isRetail, limit }) => {
     const clean = s => (s || '').replace(/\s+/g, ' ').trim();
     const priceFrom = txt => {
       const m = clean(txt).match(/\$[\d,]+(?:\.\d{2})?/);
@@ -347,8 +353,8 @@ async function marketplaceSearch(platform, query, opts = {}) {
         });
       }
     }
-    return out.slice(0, 40);
-  }, { platform, isRetail });
+    return out.slice(0, limit);
+  }, { platform, isRetail, limit });
 
   return { platform, url, count: items.length, items };
 }
