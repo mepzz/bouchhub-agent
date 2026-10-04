@@ -199,10 +199,11 @@ function buildSearchUrl(platform, query, opts = {}) {
       // opts.perPage (60 | 120 | 240) and opts.page let the hub sweep a whole
       // search ("every live Senators Future Watch auto"), not just the newest 40.
       const min = opts.minPrice ? Math.floor(opts.minPrice) : null;
-      const sold = opts.sold ? '&LH_Sold=1&LH_Complete=1&_sop=13' : '&_sop=10';
+      // opts.sort 'ending' = auctions ending soonest (_sop=1); opts.auction = auctions only.
+      const sold = opts.sold ? '&LH_Sold=1&LH_Complete=1&_sop=13' : (opts.sort === 'ending' ? '&_sop=1' : '&_sop=10');
       const perPage = [60, 120, 240].includes(Number(opts.perPage)) ? Number(opts.perPage) : null;
       const pageNo = Number(opts.page) > 1 ? Math.floor(Number(opts.page)) : null;
-      return `https://www.ebay.ca/sch/i.html?_nkw=${q}${sold}${max ? `&_udhi=${max}` : ''}${min ? `&_udlo=${min}` : ''}${opts.buyItNow ? '&LH_BIN=1' : ''}${perPage ? `&_ipg=${perPage}` : ''}${pageNo ? `&_pgn=${pageNo}` : ''}`;
+      return `https://www.ebay.ca/sch/i.html?_nkw=${q}${sold}${max ? `&_udhi=${max}` : ''}${min ? `&_udlo=${min}` : ''}${opts.buyItNow ? '&LH_BIN=1' : ''}${opts.auction ? '&LH_Auction=1' : ''}${perPage ? `&_ipg=${perPage}` : ''}${pageNo ? `&_pgn=${pageNo}` : ''}`;
     }
     // ── Retail / online stores (new + open-box) ──
     case 'amazon':          return `https://www.amazon.ca/s?k=${q}`;
