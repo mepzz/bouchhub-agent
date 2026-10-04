@@ -591,10 +591,25 @@ async function screenshot() {
   } catch (_) { return null; }
 }
 
+// ─── One thing at a time on the tab ────────────────────────
+// Everything above drives the single BouchHub tab. Two navigations landing
+// on it together abort each other ("page.goto: net::ERR_ABORTED"), which is
+// what the hub's card hunter did when its check, its ending-soon pass and
+// its reminder tick all asked at once. Each tab-driving entry point waits
+// its turn here; a failure never blocks the next caller.
+let _turn = Promise.resolve();
+function serial(fn) {
+  return (...args) => {
+    const run = _turn.then(() => fn(...args), () => fn(...args));
+    _turn = run.catch(() => {});
+    return run;
+  };
+}
+
 module.exports = {
-  launchBrowser, closeBrowser, navigate,
-  instagramLogin, instagramSendDM,
-  marketplaceSearch, extractPage, buildSearchUrl, findBrowser, BROWSERS,
+  launchBrowser, closeBrowser, navigate: serial(navigate),
+  instagramLogin: serial(instagramLogin), instagramSendDM: serial(instagramSendDM),
+  marketplaceSearch: serial(marketplaceSearch), extractPage: serial(extractPage), buildSearchUrl, findBrowser, BROWSERS,
   getPageInfo, screenshot,
   isOpen: () => !!activeBrowser,
 };
