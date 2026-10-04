@@ -341,7 +341,16 @@ async function marketplaceSearch(platform, query, opts = {}) {
         const text = clean(li.innerText);
         // Auctions: "6d 3h left" / "2h 15m left" and the bid count; a fixed
         // price shows "Buy It Now" / "or Best Offer" instead.
-        const timeLeft = clean(li.querySelector('.s-item__time-left, .s-item__time-end')?.innerText) || (text.match(/\b(\d+d\s*\d*h?|\d+h\s*\d*m?|\d+m\s*\d*s?)\s*left\b/i) || [null])[0] || null;
+        // The "time left" span first; the end-date span ("(Sat, 07:45 PM)")
+        // only as a last resort, and then the text itself: "6d 3h left",
+        // "Ends in 6d 3h", or a bare "6d 3h" / "2h 15m" in the new card layout.
+        const SPAN = /\b(\d+\s*d(?:\s*\d+\s*h)?|\d+\s*h(?:\s*\d+\s*m)?|\d+\s*m(?:\s*\d+\s*s)?)\b/i;
+        const timeLeft = clean(li.querySelector('.s-item__time-left, .s-card__time-left, [class*="time-left"]')?.innerText)
+          || (text.match(/\b(\d+d\s*\d*h?|\d+h\s*\d*m?|\d+m\s*\d*s?)\s*left\b/i) || [null])[0]
+          || (text.match(/\bends?\s*in\s*:?\s*(\d+d(?:\s*\d+h)?|\d+h(?:\s*\d+m)?|\d+m(?:\s*\d+s)?)/i) || [null])[0]
+          || (text.match(/\b(\d+d\s+\d+h|\d+h\s+\d+m|\d+m\s+\d+s)\b/i) || [null])[0]
+          || (SPAN.test(clean(li.querySelector('.s-item__time-end')?.innerText) || '') ? clean(li.querySelector('.s-item__time-end').innerText) : null)
+          || null;
         const bidsText = clean(li.querySelector('.s-item__bids, .s-item__bidCount')?.innerText) || (text.match(/\b(\d+)\s*bids?\b/i) || [null])[0];
         const bids = bidsText ? parseInt(bidsText, 10) : null;
         out.push({
