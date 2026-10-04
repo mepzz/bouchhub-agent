@@ -330,7 +330,8 @@ async function marketplaceSearch(platform, query, opts = {}) {
         const m = (a.getAttribute('href') || '').match(/\/itm\/(\d+)/);
         const id = m ? m[1] : null;
         if (!id || seen.has(id)) continue;
-        const title = clean(li.querySelector('.s-item__title, [role="heading"]')?.innerText);
+        // the heading carries a screen-reader note ("Opens in a new window or tab") that is not part of the title
+        const title = clean((li.querySelector('.s-item__title, [role="heading"]')?.innerText || '').replace(/opens in a new window or tab/gi, ' '));
         if (!title || /shop on ebay/i.test(title)) continue;
         const img = li.querySelector('img');
         seen.add(id);
