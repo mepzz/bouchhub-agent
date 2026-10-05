@@ -79,7 +79,13 @@ function syncProfileFromChrome(userData) {
 }
 
 // ─── Launch BouchHub Chrome window ────────────────────────
-async function launchBrowser() {
+// Runs HEADLESS by default: no window ever appears, so a marketplace/card search
+// can never pop up, steal focus, or show over a fullscreen game. The synced
+// profile (cookies/logins) still applies, and --headless=new keeps sites working
+// and is far harder to detect than the old headless mode. Set the env var
+// BOUCHHUB_BROWSER_VISIBLE=1 to launch a real minimized window instead — only
+// needed for something interactive like completing an Instagram 2FA prompt.
+async function launchBrowser(opts = {}) {
   if (activeBrowser) return { browser: activeBrowser, page: activePage };
 
   // Try connecting to existing BouchHub debug session
@@ -94,19 +100,32 @@ async function launchBrowser() {
     // Sync cookies from the real profile so we're already logged in
     if (browser.userData) syncProfileFromChrome(browser.userData);
 
-    const args = [
+    const headless = opts.headless !== undefined
+      ? opts.headless
+      : process.env.BOUCHHUB_BROWSER_VISIBLE !== '1';
+
+    const argList = [
       `--remote-debugging-port=${DEBUG_PORT}`,
       `--remote-debugging-address=127.0.0.1`,
       `--user-data-dir="${BOUCHHUB_PROFILE}"`,
-      '--new-window',
-      '--start-minimized',
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-notifications',
       '--disable-blink-features=AutomationControlled',
-    ].join(' ');
+      // Headless defaults to a tiny 800x600 viewport, which breaks lazy-loaded
+      // listing grids — give it a real size so scraping still sees the cards.
+      '--window-size=1280,900',
+    ];
+    if (headless) {
+      // No window at all. --headless=new (not the legacy headless) keeps the
+      // profile, extensions and a normal user-agent so logged-in scraping works.
+      argList.push('--headless=new');
+    } else {
+      argList.push('--new-window', '--start-minimized');
+    }
+    const args = argList.join(' ');
 
-    console.log(`[Browser] Opening BouchHub ${browser.name} window (minimized, separate from your tabs): ${chromePath}`);
+    console.log(`[Browser] Opening BouchHub ${browser.name} (${headless ? 'headless — no window' : 'minimized window'}, separate from your tabs): ${chromePath}`);
     exec(`"${chromePath}" ${args}`);
 
     // Wait for debug port to be ready
