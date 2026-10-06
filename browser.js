@@ -11,6 +11,12 @@ const BOUCHHUB_PROFILE = path.join(os.homedir(), 'AppData', 'Local', 'BouchHubPr
 
 let activeBrowser = null;
 let activePage = null;
+let activeHeadless = false;   // is the running browser headless (no window)?
+let forceVisible = false;     // a site blocked headless — use a minimized window from now on
+const FORCE_VISIBLE_FLAG = path.join(BOUCHHUB_PROFILE, 'force-visible.flag');
+try { forceVisible = fs.existsSync(FORCE_VISIBLE_FLAG); } catch (_) {}
+
+const { looksBlockedText } = require('./browser-block');
 
 // ─── Find a Chromium browser ───────────────────────────────
 // Chrome, Brave or Edge: all three are Chromium and take the same
@@ -41,6 +47,13 @@ function findBrowser() {
 function findChrome() { const b = findBrowser(); return b ? b.path : null; }   // back-compat
 
 // ─── Check debug port ──────────────────────────────────────
+async function debugVersion() {
+  try {
+    const fetch = require('node-fetch');
+    const r = await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/version`, { timeout: 1500 });
+    return r.ok ? await r.json() : null;
+  } catch (_) { return null; }
+}
 async function isDebugPortOpen() {
   try {
     const fetch = require('node-fetch');
@@ -91,6 +104,8 @@ async function launchBrowser(opts = {}) {
   // Try connecting to existing BouchHub debug session
   if (await isDebugPortOpen()) {
     console.log('[Browser] Reconnecting to existing BouchHub Chrome window');
+    const info = await debugVersion();
+    activeHeadless = !!(info && /Headless/i.test(`${info.Browser || ''} ${info['User-Agent'] || ''}`));
     activeBrowser = await chromium.connectOverCDP(`http://127.0.0.1:${DEBUG_PORT}`, { timeout: 5000 });
   } else {
     const browser = findBrowser();
@@ -102,7 +117,8 @@ async function launchBrowser(opts = {}) {
 
     const headless = opts.headless !== undefined
       ? opts.headless
-      : process.env.BOUCHHUB_BROWSER_VISIBLE !== '1';
+      : (process.env.BOUCHHUB_BROWSER_VISIBLE !== '1' && !forceVisible);
+    activeHeadless = headless;
 
     const argList = [
       `--remote-debugging-port=${DEBUG_PORT}`,
@@ -118,7 +134,9 @@ async function launchBrowser(opts = {}) {
     ];
     if (headless) {
       // No window at all. --headless=new (not the legacy headless) keeps the
-      // profile, extensions and a normal user-agent so logged-in scraping works.
+      // profile and extensions. It does NOT hide that it is headless: the
+      // user-agent and client hints still say "HeadlessChrome", which eBay
+      // challenges — applyIdentity() below presents a normal browser instead.
       argList.push('--headless=new');
     } else {
       argList.push('--new-window', '--start-minimized');
@@ -156,8 +174,61 @@ async function launchBrowser(opts = {}) {
     const ctx = contexts.length > 0 ? contexts[0] : await activeBrowser.newContext();
     activePage = await ctx.newPage();
   }
+  if (activeHeadless) await applyIdentity(activePage);
 
   return { browser: activeBrowser, page: activePage };
+}
+
+// Present a normal desktop Chrome: drop "Headless" from the user-agent and from
+// the Sec-CH-UA client hints. Best-effort — a failure here must never stop a search.
+async function applyIdentity(page) {
+  try {
+    const info = await debugVersion();
+    const raw = String((info && info['User-Agent']) || '');
+    if (!/Headless/i.test(raw)) return;
+    const userAgent = raw.replace(/HeadlessChrome/g, 'Chrome');
+    const full = (/Chrome\/([\d.]+)/.exec(userAgent) || [])[1] || '120.0.0.0';
+    const major = full.split('.')[0];
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Emulation.setUserAgentOverride', {
+      userAgent,
+      acceptLanguage: 'en-CA,en;q=0.9',
+      platform: 'Win32',
+      userAgentMetadata: {
+        brands: [{ brand: 'Chromium', version: major }, { brand: 'Google Chrome', version: major }, { brand: 'Not_A Brand', version: '24' }],
+        fullVersionList: [{ brand: 'Chromium', version: full }, { brand: 'Google Chrome', version: full }, { brand: 'Not_A Brand', version: '24.0.0.0' }],
+        platform: 'Windows', platformVersion: '10.0.0', architecture: 'x86', model: '', mobile: false, bitness: '64', wow64: false,
+      },
+    });
+  } catch (e) { console.warn('[Browser] could not set a normal browser identity:', e.message); }
+}
+
+// Shut the BouchHub browser PROCESS down (closeBrowser only disconnects from it),
+// so the next launch can come up in a different mode on the same debug port.
+async function killBrowser() {
+  try { if (activeBrowser) { const s = await activeBrowser.newBrowserCDPSession(); await s.send('Browser.close'); } } catch (_) {}
+  activeBrowser = null; activePage = null;
+  for (let i = 0; i < 12; i++) { if (!(await isDebugPortOpen())) return; await new Promise(r => setTimeout(r, 500)); }
+}
+
+// Run a page job; if it ran headless and the site served a block/challenge page,
+// switch to a minimized window (remembered across restarts) and run it once more.
+// Cards must keep working — a visible window is the lesser evil to no results.
+async function withHeadlessFallback(job) {
+  const out = await job();
+  if (!activeHeadless || forceVisible || !activePage) return out;
+  let blocked = false;
+  try {
+    const title = await activePage.title();
+    const body = await activePage.evaluate(() => (document.body ? document.body.innerText : '') || '');
+    blocked = looksBlockedText(title, body);
+  } catch (_) {}
+  if (!blocked) return out;
+  console.warn('[Browser] a site blocked the headless browser — switching to a minimized window from now on (delete AppData\\Local\\BouchHubProfile\\force-visible.flag to retry headless)');
+  forceVisible = true;
+  try { fs.mkdirSync(BOUCHHUB_PROFILE, { recursive: true }); fs.writeFileSync(FORCE_VISIBLE_FLAG, new Date().toISOString()); } catch (_) {}
+  await killBrowser();
+  return job();
 }
 
 // ─── Close BouchHub window only ────────────────────────────
@@ -245,7 +316,7 @@ function buildSearchUrl(platform, query, opts = {}) {
 // Platforms whose results we read with the generic retail extractor below.
 const RETAIL_PLATFORMS = ['amazon', 'bestbuy', 'walmart', 'newegg', 'staples', 'canadacomputers', 'ebgames', 'brand'];
 
-async function marketplaceSearch(platform, query, opts = {}) {
+async function _marketplaceSearch(platform, query, opts = {}) {
   const { page } = await launchBrowser();
   const url = buildSearchUrl(platform, query, opts);
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
@@ -389,8 +460,10 @@ async function marketplaceSearch(platform, query, opts = {}) {
   return { platform, url, count: items.length, items };
 }
 
+const marketplaceSearch = (platform, query, opts = {}) => withHeadlessFallback(() => _marketplaceSearch(platform, query, opts));
+
 // Fetch the readable text of a single item/product page (for link parsing).
-async function extractPage(url) {
+async function _extractPage(url) {
   const { page } = await launchBrowser();
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
   await page.waitForTimeout(2500);
@@ -409,6 +482,8 @@ async function extractPage(url) {
     };
   });
 }
+
+const extractPage = (url) => withHeadlessFallback(() => _extractPage(url));
 
 // ─── Instagram Login ───────────────────────────────────────
 async function instagramLogin(username, password) {
@@ -630,6 +705,6 @@ module.exports = {
   launchBrowser, closeBrowser, navigate: serial(navigate),
   instagramLogin: serial(instagramLogin), instagramSendDM: serial(instagramSendDM),
   marketplaceSearch: serial(marketplaceSearch), extractPage: serial(extractPage), buildSearchUrl, findBrowser, BROWSERS,
-  getPageInfo, screenshot,
+  getPageInfo, screenshot, looksBlockedText,
   isOpen: () => !!activeBrowser,
 };
