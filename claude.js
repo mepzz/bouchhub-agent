@@ -247,7 +247,20 @@ function binCandidates(name) {
   }
   return [...new Set(list.filter(Boolean))];
 }
+// Is a cached binary path (quoted or not) a real file path that no longer
+// exists? A bare command name has no slash and is left to PATH, so it is never
+// "gone". This is what a native reinstall does to an old npm `claude.cmd`.
+function binGone(bin) {
+  const raw = String(bin || '').replace(/^"|"$/g, '');
+  if (!/[\\/]/.test(raw)) return false;
+  try { return !require('fs').existsSync(raw); } catch (_) { return false; }
+}
 async function resolveBin(name = 'claude') {
+  // The cache is for the life of the process, so a CLI that moved or was
+  // reinstalled used to stay poisoned until the agent restarted — and the voice
+  // path (which reads this cache) kept launching a path that no longer existed.
+  // Re-check the file; if it is gone, forget it and search again.
+  if (_bins[name] && binGone(_bins[name])) { delete _bins[name]; delete _search[name]; }
   if (_bins[name]) return _bins[name];
   const cli = providerOf(name).cli;
   const trace = _search[name] = [];
@@ -421,7 +434,7 @@ function excerpt(s) {
 async function complete({ provider = 'claude', prompt, timeoutMs = 180000, allowTools = [] } = {}) {
   if (!prompt) throw new Error('complete needs a prompt');
   const p = providerOf(provider);
-  let bin = _bins[provider] || (await resolveBin(provider)) || process.env[p.binEnv] || p.cli;
+  let bin = (await resolveBin(provider)) || process.env[p.binEnv] || p.cli;
   if (!bin) throw new Error(`${provider} CLI not found on this PC`);
   const fs = require('fs');
   const tmp = path.join(os.tmpdir(), `bouchhub-complete-${provider}-${Date.now()}.txt`);
@@ -662,7 +675,7 @@ async function voice({ provider = 'claude', prompt, model, systemPrompt = '', mc
   if (!prompt) throw new Error('voice needs a prompt');
   const fs = require('fs');
   const p = providerOf(provider);
-  const exe = bin || _bins[provider] || (await resolveBin(provider)) || process.env[p.binEnv] || p.cli;
+  const exe = bin || (await resolveBin(provider)) || process.env[p.binEnv] || p.cli;
   if (!exe) throw new Error(`${provider} CLI not found on this PC`);
   if ((_voiceRuns[provider] || 0) >= VOICE_MAX_CONCURRENT) throw new Error(`${provider} is already answering ${VOICE_MAX_CONCURRENT} voice questions`);
 
@@ -729,5 +742,5 @@ module.exports = {
   status, work, complete, parseUsage, parseLimit, preflight, consoleTail,
   resolveBin, resolveClaude, PROVIDERS, logPathFor, workFolderFor, LOG_PATH,
   voice, buildVoiceArgs, voiceWorkFolder, mcpUrlFor, VOICE_DEFAULT_TOOLS,
-  authFailure, _run: run, _killTree: killTree, _modelFlag: modelFlag, _modelOptFor: modelOptFor, _providerFlags: providerFlags,
+  authFailure, binGone, looksLikeMissingBinary, forgetBin, _bins, _run: run, _killTree: killTree, _modelFlag: modelFlag, _modelOptFor: modelOptFor, _providerFlags: providerFlags,
 };
