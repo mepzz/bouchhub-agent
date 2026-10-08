@@ -232,6 +232,22 @@ async function unloadText(model = TEXT_MODEL) {
   } catch (e) { return { ok: false, error: reason(e) }; }
 }
 
+// Drop every model Ollama has loaded, not only the default one — what game mode
+// wants: the deputy and worker models are different models, and any of them
+// can be the one sitting in VRAM.
+async function unloadAllText() {
+  let loaded;
+  try { loaded = ((await jsonReq(`${OLLAMA}/api/ps`, { timeoutMs: 5000 })).models || []).map(m => m.name || m.model).filter(Boolean); }
+  catch (e) { return { ok: false, error: reason(e) }; }
+  const unloaded = [];
+  const failed = [];
+  for (const model of loaded) {
+    const r = await unloadText(model);
+    (r.ok ? unloaded : failed).push(model);
+  }
+  return { ok: failed.length === 0, unloaded, ...(failed.length ? { failed } : {}) };
+}
+
 // ── ComfyUI ──────────────────────────────────────────────────────────────────
 // Queue a workflow and wait for it. ComfyUI is asynchronous — you post a prompt,
 // get an id, and poll history — so the waiting is done here rather than making
@@ -354,7 +370,7 @@ async function swapFaces({ basePath, refPaths, outPath }) {
 }
 
 module.exports = {
-  health, chat, unloadText, runWorkflow, fetchOutput, uploadInput, interrupt,
+  health, chat, unloadText, unloadAllText, runWorkflow, fetchOutput, uploadInput, interrupt,
   swapFaces, stripThinking, thinkingOf, freeComfy, listModels, pullModel, OUT_OF_MEMORY,
   OLLAMA, COMFY, TEXT_MODEL, VISION_MODEL, COMFY_HOME, COMFY_PYTHON, SWAPPER, comfyError,
 };

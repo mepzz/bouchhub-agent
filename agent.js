@@ -256,7 +256,8 @@ app.post('/local/pull', async (req, res) => {
 app.post('/local/unload', async (req, res) => {
   const what = req.body?.what || 'both';
   const out = {};
-  if (what === 'text' || what === 'both') out.text = await local.unloadText(req.body?.model);
+  // `all: true` drops every loaded Ollama model (game mode), not just the default one.
+  if (what === 'text' || what === 'both') out.text = req.body?.all ? await local.unloadAllText() : await local.unloadText(req.body?.model);
   if (what === 'comfy' || what === 'both') out.comfy = await local.freeComfy();
   res.json({ ok: Object.values(out).some(r => r && r.ok), ...out });
 });
@@ -400,6 +401,14 @@ $busy = @(Get-Process -EA SilentlyContinue | Where-Object { $_.MainWindowHandle 
     // as permission to start work.
     res.json({ idleSeconds: 0, away: false, error: e.message });
   }
+});
+
+// Game mode: is a game running? The hub polls this and pauses its background
+// work while one is (see game.js for what counts).
+const game = require('./game');
+app.get('/game', async (req, res) => {
+  try { res.json(await game.detect({ gpuUsage: cachedStats.gpu ? cachedStats.gpu.usage : null })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // The face-match photo pipeline, end to end. Three stages: ComfyUI makes the
