@@ -411,6 +411,19 @@ app.get('/game', async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Warm up: raise the power-state floors in steps before gaming (power.js).
+// The hub runs the schedule; these are the single steps.
+const power = require('./power');
+const powerRoute = (fn) => async (req, res) => {
+  if (process.platform !== 'win32') return res.status(501).json({ error: 'power schemes are Windows-only' });
+  try { res.json(await fn(req.body || {})); }
+  catch (e) { res.status(e.elevation ? 403 : 500).json({ error: e.message, elevation: !!e.elevation }); }
+};
+app.get('/power/status', powerRoute(() => power.status()));
+app.post('/power/warm/prepare', powerRoute((b) => power.prepare({ originalHint: b.originalHint || null })));
+app.post('/power/warm/stage', powerRoute((b) => power.applyStage({ warmGuid: b.warmGuid, stage: b.stage, baseline: b.baseline || {} })));
+app.post('/power/warm/restore', powerRoute((b) => power.restore({ originalGuid: b.originalGuid, warmGuid: b.warmGuid || null })));
+
 // The face-match photo pipeline, end to end. Three stages: ComfyUI makes the
 // base image, insightface swaps the faces in frame order, ComfyUI restores and
 // upscales. Orchestrated here because stage two is a subprocess and the other
